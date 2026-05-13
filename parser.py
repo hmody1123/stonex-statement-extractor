@@ -14,6 +14,33 @@ import fitz  # PyMuPDF
 import pandas as pd
 from openpyxl.styles import Font, PatternFill, Alignment
 
+
+
+def _daily_open_positions_backstop(pdf_bytes: bytes, include_open_positions: bool = True) -> list[dict]:
+    """Parse all classic daily-statement OPEN POSITION rows across all pages.
+
+    This is a safety net for continuation pages that repeat only the column header
+    ("CONTRACT DESCRIPTION-OPEN") and not the full spaced OPEN POSITIONS title.
+    """
+    if not include_open_positions:
+        return []
+    rows: list[dict] = []
+    for page_no, text in pdf_text(pdf_bytes):
+        if "CONTRACT DESCRIPTION-OPEN" not in text:
+            continue
+        stmt_date = _statement_date(text)
+        account = _account_number(text)
+        for raw in text.splitlines():
+            line = " ".join(raw.strip().split())
+            if not line or line.startswith("-------") or line.startswith("TRADE CARD"):
+                continue
+            parsed = _parse_daily_open_position_line(line)
+            if parsed:
+                row = _base_row(parsed, stmt_date, account, page_no, line)
+                row["market_value_signed"] = _signed(row.get("market_value"), row.get("drcr"))
+                rows.append(row)
+    return rows
+
 MONTHS = {m: i for i, m in enumerate(["JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"], 1)}
 DATE_RE = re.compile(r"(?P<m>JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)\s+(?P<d>\d{1,2}),\s+(?P<y>\d{4})")
 STATEMENT_DATE_RE = re.compile(r"STATEMENT DATE:\s+" + DATE_RE.pattern, re.I)
@@ -117,8 +144,16 @@ def _parse_daily_open_position_line(line: str) -> dict | None:
     price = _parse_price_token(price_tokens)
     if price is None:
         return None
-    st = toks[price_start - 1] if price_start - 1 > acct_idx else None
-    desc_tokens = toks[acct_idx + 2:price_start-1]
+    # Some statements have a status token immediately before price (e.g., SE), but
+    # others put the product symbol there (e.g., SCM TSR20RUBBR 210.0 US 1,020.00DR).
+    # Treat the pre-price token as status only when it looks like a short code.
+    pre_price = toks[price_start - 1] if price_start - 1 > acct_idx else None
+    if pre_price and re.match(r"^[A-Z]{1,3}$", pre_price):
+        st = pre_price
+        desc_tokens = toks[acct_idx + 2:price_start-1]
+    else:
+        st = None
+        desc_tokens = toks[acct_idx + 2:price_start]
     if not desc_tokens:
         return None
     contract_month = contract_year = option_type = None
@@ -298,8 +333,12 @@ def _num_any(value: str | None) -> float | None:
     s = str(value).strip()
     if not s:
         return None
-    neg = s.startswith('(') and s.endswith(')')
+    neg = (s.startswith('(') and s.endswith(')')) or s.endswith('-') or s.startswith('-')
     s = s.replace('$','').replace(',','').replace('(','').replace(')','').strip()
+    if s.endswith('-'):
+        s = s[:-1].strip()
+    if s.startswith('-'):
+        s = s[1:].strip()
     try:
         v = float(s)
     except ValueError:
@@ -736,12 +775,24 @@ def extract(pdf_bytes: bytes, include_open_positions: bool = True) -> Dict[str, 
         if not saw_stmt:
             exceptions.append({"statement_date": None, "account_number": account, "page": page_no, "section": None, "reason": "Statement date not found", "source_line": ""})
 
+    # Backstop parse ensures continuation pages with only the classic open-position
+    # column header are included. Avoid duplicates by source line + page.
+    backstop_positions = _daily_open_positions_backstop(pdf_bytes, include_open_positions=include_open_positions)
+    if backstop_positions:
+        existing_keys = {(r.get("page"), r.get("source_line")) for r in open_positions}
+        for r in backstop_positions:
+            key = (r.get("page"), r.get("source_line"))
+            if key not in existing_keys:
+                open_positions.append(r)
+                existing_keys.add(key)
+
     tables: Dict[str, pd.DataFrame] = {
         "Executed Trades": pd.DataFrame(executed),
         "Purchase & Sale": pd.DataFrame(purchase_sale),
         "Receives Delivers": pd.DataFrame(receives_delivers),
         "Journal Entries": pd.DataFrame(journals),
         "Realized Gain and Loss": pd.DataFrame(),
+        "Realized PNL Summary": _parse_realized_pnl_summary_from_text(pdf_bytes),
         "Open Positions": pd.DataFrame(open_positions),
         "Notes": pd.DataFrame(notes),
         "Exceptions": pd.DataFrame(exceptions),
@@ -768,6 +819,43 @@ def enrich_open_positions_metadata(tables: Dict[str, pd.DataFrame]) -> Dict[str,
     tables["Open Positions"] = df
     return tables
 
+
+
+
+def _parse_realized_pnl_summary_from_text(pdf_bytes: bytes) -> pd.DataFrame:
+    """Parse summary-level realized P&L rows when no row-level realized detail exists.
+
+    Classic daily statements can show only a summary line such as:
+      REALIZED PROFIT & LOSS
+       USD 431,445.00- 440,805.00-
+    where values are M-T-D and Y-T-D. This function captures those rows.
+    """
+    rows: list[dict] = []
+    amount_pat = r"(?:[\d,]+(?:\.\d+)?-?|\([\d,]+(?:\.\d+)?\))"
+    for page_no, text in pdf_text(pdf_bytes):
+        stmt_date = _statement_date(text)
+        account = _account_number(text)
+        lines = [" ".join(x.strip().split()) for x in text.splitlines() if x.strip()]
+        for i, line in enumerate(lines):
+            if "REALIZED PROFIT" in line.upper() and "LOSS" in line.upper():
+                # Usually the next non-empty line is: USD 431,445.00- 440,805.00-
+                for j in range(i + 1, min(i + 6, len(lines))):
+                    nxt = lines[j]
+                    m = re.match(rf"^(?P<currency>[A-Z]{{3}})\s+(?P<mtd>{amount_pat})\s+(?P<ytd>{amount_pat})\s*$", nxt)
+                    if m:
+                        rows.append({
+                            "statement_date": stmt_date,
+                            "account_number": account,
+                            "currency": m.group("currency"),
+                            "mtd_realized_pnl": _num_any(m.group("mtd")),
+                            "ytd_realized_pnl": _num_any(m.group("ytd")),
+                            "source_sheet": "Statement Summary",
+                            "source_section": "REALIZED PROFIT & LOSS",
+                            "page": page_no,
+                            "source_line": nxt,
+                        })
+                        break
+    return pd.DataFrame(rows)
 
 def build_summary(tables: Dict[str, pd.DataFrame]) -> pd.DataFrame:
     rows = []
@@ -800,7 +888,7 @@ def grouped_trades(tables: Dict[str, pd.DataFrame]) -> pd.DataFrame:
 def parse_contract_product(desc: str | None) -> dict:
     """Parse a StoneX contract description into grouping fields."""
     desc = "" if desc is None else str(desc).strip()
-    exchanges = "LME|CBOT|CBT|NYMEX|CME|ICE|MGEX"
+    exchanges = "LME|SCM|CBOT|CBT|NYMEX|CME|ICE|MGEX"
     if desc.upper().startswith("LME "):
         parts = desc.split()
         exchange = "LME"
@@ -808,6 +896,10 @@ def parse_contract_product(desc: str | None) -> dict:
         unit = parts[-1] if len(parts) > 2 and re.match(r"^[A-Z]{3}|\$$", parts[-1]) else None
         product_name = " ".join(parts[1:-1] if unit else parts[1:])
         return {"product": f"LME {product_name}".strip(), "exchange": exchange, "product_name": product_name, "strike": None, "option_type": "Other", "unit": unit}
+    if desc.upper().startswith("SCM "):
+        parts = desc.split(maxsplit=1)
+        product_name = parts[1] if len(parts) > 1 else ""
+        return {"product": f"SCM {product_name}".strip(), "exchange": "SCM", "product_name": product_name, "strike": None, "option_type": "Other", "unit": None}
     m = re.search(rf"\b({exchanges})\s+(.+?)(?=\s+\d+(?:\.\d+)?)", desc)
     if m:
         exchange = m.group(1)
@@ -971,17 +1063,15 @@ def grouped_positions_custom(tables: Dict[str, pd.DataFrame], group_cols: list[s
     return _group_prepared_positions(df, group_cols, price_col, mv_col)
 
 
-def merge_extracted_tables(tables_list: list[Dict[str, pd.DataFrame]], position_mode: str = "latest_by_account") -> Dict[str, pd.DataFrame]:
+def merge_extracted_tables(tables_list: list[Dict[str, pd.DataFrame]], position_mode: str = "append_all") -> Dict[str, pd.DataFrame]:
     """Merge extracted tables from multiple PDFs.
 
     position_mode:
-      - latest_by_account: keep open-position rows only from the latest statement_date for each account_number.
-        This is safest for merging multiple monthly/daily snapshot statements.
-      - append_all: keep every open-position row from every PDF, useful for audit/time-series review.
+      - append_all: keep every open-position row from every PDF. This is now the only UI behavior.
     """
     sheet_names = [
         "Executed Trades", "Purchase & Sale", "Receives Delivers", "Journal Entries",
-        "Realized Gain and Loss", "Open Positions", "Notes", "Exceptions"
+        "Realized Gain and Loss", "Realized PNL Summary", "Open Positions", "Notes", "Exceptions"
     ]
     merged: Dict[str, pd.DataFrame] = {}
     for name in sheet_names:
@@ -1006,24 +1096,24 @@ def merge_extracted_tables(tables_list: list[Dict[str, pd.DataFrame]], position_
 
     pos = merged.get("Open Positions", pd.DataFrame())
     if pos is not None and not pos.empty:
-        pos_keys = [c for c in ["account_number", "statement_date", "trade_date", "trade_id", "global_id", "contract_description", "ref_month", "end_date", "long", "short", "quantity", "trade_price", "price", "market_value", "market_value_signed"] if c in pos.columns]
-        if pos_keys:
-            merged["Open Positions"] = pos.drop_duplicates(subset=pos_keys, keep="first").reset_index(drop=True)
+        # Open-position rows are card/trade-line level. Do NOT de-duplicate only on
+        # product/qty/price/value because statements can legitimately contain many
+        # separate cards with identical qty/price/value. The rubber/SCM statement is
+        # a good example: many one-lot rows at the same price.
+        #
+        # This strict key removes true duplicate uploads/duplicate extracted lines,
+        # while preserving unique cards/rows on continuation pages.
+        strict_keys = [c for c in [
+            "account_number", "statement_date", "trade_date", "trade_date_iso",
+            "card", "account_type", "contract_month", "contract_year",
+            "contract_description", "ref_month", "delivery_date", "settlement_date",
+            "long", "short", "quantity", "trade_price", "price",
+            "currency", "market_value", "market_value_signed", "drcr",
+            "page", "source_line"
+        ] if c in pos.columns]
+        if strict_keys:
+            merged["Open Positions"] = pos.drop_duplicates(subset=strict_keys, keep="first").reset_index(drop=True)
             pos = merged["Open Positions"]
-
-    if position_mode == "latest_by_account" and pos is not None and not pos.empty and "statement_date" in pos.columns:
-        df = pos.copy()
-        df["_stmt_dt"] = pd.to_datetime(df["statement_date"], errors="coerce")
-        # Use account if present; otherwise treat all blanks as one account bucket.
-        acct_col = "account_number" if "account_number" in df.columns else None
-        if acct_col:
-            latest = df.groupby(acct_col, dropna=False)["_stmt_dt"].transform("max")
-            df = df[(df["_stmt_dt"] == latest) | df["_stmt_dt"].isna()]
-        else:
-            max_dt = df["_stmt_dt"].max()
-            if pd.notna(max_dt):
-                df = df[df["_stmt_dt"] == max_dt]
-        merged["Open Positions"] = df.drop(columns=["_stmt_dt"], errors="ignore").reset_index(drop=True)
 
     # Add a merge summary/notes sheet.
     note_rows = []
@@ -1042,7 +1132,11 @@ def merge_extracted_tables(tables_list: list[Dict[str, pd.DataFrame]], position_
 
 
 def realized_pnl_summary(tables: Dict[str, pd.DataFrame]) -> pd.DataFrame:
-    """Absolute-basic realized PNL view from Realized Gain and Loss and Purchase & Sale."""
+    """Absolute-basic realized PNL view.
+
+    Uses row-level Realized Gain and Loss / Purchase & Sale where available.
+    If the statement only has a summary-level realized P&L section, includes MTD/YTD rows.
+    """
     frames = []
     realized = tables.get("Realized Gain and Loss", pd.DataFrame())
     if realized is not None and not realized.empty:
@@ -1052,7 +1146,9 @@ def realized_pnl_summary(tables: Dict[str, pd.DataFrame]) -> pd.DataFrame:
             df["realized_pnl"] = df["cash_flow"].apply(_num_any)
         elif "amount_signed" in df.columns:
             df["realized_pnl"] = df["amount_signed"].apply(_num_any)
+        df["pnl_view"] = "Detail"
         frames.append(df)
+
     ps = tables.get("Purchase & Sale", pd.DataFrame())
     if ps is not None and not ps.empty:
         df = ps.copy()
@@ -1061,27 +1157,44 @@ def realized_pnl_summary(tables: Dict[str, pd.DataFrame]) -> pd.DataFrame:
             df["realized_pnl"] = df["amount_signed"].apply(_num_any)
         elif "amount" in df.columns:
             df["realized_pnl"] = [_signed(a, d) for a, d in zip(df.get("amount"), df.get("drcr"))]
+        df["pnl_view"] = "Detail"
         frames.append(df)
+
+    summary = tables.get("Realized PNL Summary", pd.DataFrame())
+    if summary is not None and not summary.empty:
+        df = summary.copy()
+        df["source_sheet"] = "Statement Summary"
+        df["pnl_view"] = "Summary"
+        # Use MTD as the primary realized_pnl displayed in total metric.
+        if "mtd_realized_pnl" in df.columns:
+            df["realized_pnl"] = df["mtd_realized_pnl"].apply(_num_any)
+        frames.append(df)
+
     if not frames:
         return pd.DataFrame()
+
     detail = pd.concat(frames, ignore_index=True, sort=False)
     if "contract_description" in detail.columns:
         parsed = detail["contract_description"].apply(parse_contract_product).apply(pd.Series)
         for col in parsed.columns:
             if col not in detail.columns or detail[col].isna().all():
                 detail[col] = parsed[col]
+
     wanted = [
-        "statement_date", "account_number", "trade_date", "trade_date_iso", "trade_id",
-        "contract_description", "quantity", "long", "short", "trade_price", "price",
-        "cash_flow", "amount_signed", "realized_pnl", "source_sheet", "source_pdf"
+        "pnl_view", "statement_date", "account_number", "currency",
+        "mtd_realized_pnl", "ytd_realized_pnl", "realized_pnl",
+        "trade_date", "trade_date_iso", "trade_id", "contract_description",
+        "quantity", "long", "short", "trade_price", "price", "cash_flow", "amount_signed",
+        "source_sheet", "source_section", "source_pdf", "page", "source_line"
     ]
     cols = [c for c in wanted if c in detail.columns]
     return detail[cols].copy()
 
+
 def statement_dates_by_account(tables: Dict[str, pd.DataFrame]) -> pd.DataFrame:
     """Return statement-date coverage by account for audit after multi-PDF merge."""
     frames = []
-    for name in ["Executed Trades", "Open Positions", "Purchase & Sale", "Receives Delivers", "Realized Gain and Loss"]:
+    for name in ["Executed Trades", "Open Positions", "Purchase & Sale", "Receives Delivers", "Realized Gain and Loss", "Realized PNL Summary"]:
         df = tables.get(name, pd.DataFrame())
         if df is not None and not df.empty:
             cols = [c for c in ["source_pdf", "account_number", "statement_date"] if c in df.columns]

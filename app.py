@@ -21,13 +21,7 @@ with st.sidebar:
     show_source_lines = st.checkbox("Show source_line columns", value=False)
     st.markdown("---")
     st.subheader("Multi-PDF merge")
-    position_mode = st.radio(
-        "When multiple PDFs are uploaded, how should open positions be merged?",
-        options=["latest_by_account", "append_all"],
-        index=0,
-        format_func=lambda x: "Keep latest position snapshot per account" if x == "latest_by_account" else "Append all position snapshots",
-        help="Positions are snapshots. Use latest_by_account to avoid double-counting if you upload multiple statement dates for the same account.",
-    )
+    st.caption("Open positions are always appended from all uploaded PDFs. No latest-snapshot filtering is applied.")
     st.markdown("---")
     st.subheader("Column display")
     st.caption("After upload, use the column selector above each table to customize what is shown.")
@@ -82,7 +76,7 @@ if uploaded_files:
             tables = add_source_pdf(tables, uploaded.name, idx)
             extracted_tables.append(tables)
 
-    merged_tables = merge_extracted_tables(extracted_tables, position_mode=position_mode)
+    merged_tables = merge_extracted_tables(extracted_tables)
     merged_excel = to_excel_bytes(merged_tables)
 
     st.subheader("Merged output")
@@ -153,12 +147,13 @@ if uploaded_files:
         st.caption("Absolute-basic realized PNL view.")
         pnl_df = realized_pnl_summary(merged_tables)
         if not pnl_df.empty and "realized_pnl" in pnl_df.columns:
-            st.metric("Total realized PNL", f"{pd.to_numeric(pnl_df['realized_pnl'], errors='coerce').sum():,.2f}")
+            metric_df = pnl_df[pnl_df.get("pnl_view", "") == "Summary"] if "pnl_view" in pnl_df.columns else pnl_df
+            st.metric("MTD realized PNL", f"{pd.to_numeric(metric_df['realized_pnl'], errors='coerce').sum():,.2f}")
         display_custom_table(
             "Realized PNL",
             pnl_df,
-            default_columns=["statement_date", "account_number", "trade_date", "trade_id", "contract_description", "quantity", "trade_price", "cash_flow", "realized_pnl"],
-            default_only=True,
+            default_columns=["pnl_view", "statement_date", "account_number", "currency", "mtd_realized_pnl", "ytd_realized_pnl", "realized_pnl", "trade_date", "trade_id", "contract_description", "quantity", "trade_price", "cash_flow", "source_sheet"],
+            default_only=False,
         )
     with tabs[3]:
         st.caption("Use this sheet to confirm which statement date was used for each account/source file.")
@@ -176,7 +171,7 @@ if uploaded_files:
                 "currency", "market_value", "market_value_signed",
                 "statement_date", "account_number", "trade_date_iso", "source_section"
             ],
-            default_only=True,
+            default_only=False,
         )
     with tabs[6]:
         for name, df in merged_tables.items():
@@ -200,7 +195,7 @@ else:
         """
         **Multi-PDF behavior:**
         - Trades are appended and de-duplicated when possible.
-        - Open positions are snapshots. The default keeps only the latest statement date per account.
-        - Use **Append all position snapshots** only when you want a time-series/audit file.
+        - Open positions are always appended from all uploaded PDFs.
+        - No latest-snapshot filtering is applied.
         """
     )

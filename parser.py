@@ -34,7 +34,7 @@ def _daily_open_positions_backstop(pdf_bytes: bytes, include_open_positions: boo
             line = " ".join(raw.strip().split())
             if not line or line.startswith("-------") or line.startswith("TRADE CARD"):
                 continue
-            parsed = _parse_daily_open_position_line(line)
+            parsed = _parse_daily_open_position_line(line, raw)
             if parsed:
                 row = _base_row(parsed, stmt_date, account, page_no, line)
                 row["market_value_signed"] = _signed(row.get("market_value"), row.get("drcr"))
@@ -50,7 +50,7 @@ ACCOUNT_RE = re.compile(r"ACCOUNT NUMBER:\s+(?P<account>\S+)", re.I)
 TRADE_LINE_RE = re.compile(
     r"^(?P<trade_date>\d{1,2}/\d{2}/\d)\s+"
     r"(?P<card>[A-Z0-9]+)\s+"
-    r"(?P<account_type>U\d)\s+"
+    r"(?P<account_type>[A-Z]\d)\s+"
     r"(?P<quantity>\d[\d,]*)\s+"
     r"(?P<contract_month>[A-Z]{3})\s+"
     r"(?P<contract_year>\d{2})\s+"
@@ -82,6 +82,19 @@ OPEN_POSITION_LINE_RE = re.compile(
 
 FEE_OR_AVG_KEYWORDS = ["COMMISSION", "CLEARING FEE", "AVG LONG", "AVG SHORT", "GROSS PROFIT OR LOSS"]
 
+# Purchase & Sale close summary rows are the realized/closed-position details.
+# Examples:
+#   A2 55* 55* LTD- 6/18/26 GROSS PROFIT OR LOSS AD 14,125.00CR
+#   U2 241* 241* LTD- 6/30/26 GROSS PROFIT OR LOSS US 155,735.00CR
+CLOSED_POSITION_GROSS_RE = re.compile(
+    r"^(?P<account_type>[A-Z]\d)\s+"
+    r"(?:(?P<long>[\d,]+)\*\s+)?"
+    r"(?:(?P<short>[\d,]+)\*\s+)?"
+    r"(?P<close_status>.+?)\s+GROSS\s+PROFIT\s+OR\s+LOSS\s+"
+    r"(?P<currency>[A-Z]{2})\s+(?P<amount>[\d,]+(?:\.\d{2})?)(?P<drcr>DR|CR)\s*$",
+    re.I,
+)
+
 FRACTION_RE = re.compile(r"^\d+/\d+$")
 
 def _parse_price_token(tokens: list[str]) -> float | None:
@@ -105,19 +118,52 @@ def _split_amount_drcr(token: str | None) -> tuple[str | None, str | None]:
     if token is None:
         return None, None
     t = token.strip()
-    m = re.match(r"^(?P<amount>(?:[\d,]+)?\.\d{2}|[\d,]+\.\d{2})(?P<drcr>DR|CR)?$", t)
+    m = re.match(r"^(?P<amount>(?:[\d,]+)?\.\d{2}|[\d,]+(?:\.\d+)?|0)(?P<drcr>DR|CR)?$", t)
     if not m:
         return None, None
     return m.group('amount'), m.group('drcr')
 
 
-def _parse_daily_open_position_line(line: str) -> dict | None:
+
+def _parse_closed_position_gross_line(line: str, last_contract: dict | None = None) -> dict | None:
+    """Parse P&S GROSS PROFIT OR LOSS lines into closed-position detail rows."""
+    m = CLOSED_POSITION_GROSS_RE.match(line)
+    if not m:
+        return None
+    row = m.groupdict()
+    row["long"] = _num_any(row.get("long"))
+    row["short"] = _num_any(row.get("short"))
+    row["quantity"] = (row.get("long") or 0) - (row.get("short") or 0)
+    row["realized_pnl"] = _signed(row.get("amount"), row.get("drcr"))
+    row["amount_signed"] = row["realized_pnl"]
+    row["source_section"] = "Closed Positions"
+    row["pnl_view"] = "Closed Position Detail"
+
+    status = str(row.get("close_status") or "")
+    mdate = re.search(r"(\d{1,2}/\d{1,2}/\d{2,4})", status)
+    row["close_date"] = mdate.group(1) if mdate else None
+    mclose = re.search(r"\bCLOSE\s+(?P<close_price>[-+]?\d+(?:\.\d+)?)", status)
+    row["close_price"] = _num_any(mclose.group("close_price")) if mclose else None
+
+    if last_contract:
+        for k in [
+            "contract_description", "contract_month", "contract_year", "ref_month",
+            "trade_id", "card", "price", "trade_price", "product", "exchange",
+            "option_type", "strike"
+        ]:
+            if k in last_contract and row.get(k) in (None, ""):
+                row[k] = last_contract.get(k)
+    return row
+
+
+def _parse_daily_trade_or_ps_line(line: str) -> dict | None:
+    """Parse classic daily confirmation/P&S rows that may not have debit/credit amount."""
     toks = line.split()
-    if len(toks) < 9 or not re.match(r"^\d{1,2}/\d{2}/\d$", toks[0]):
+    if len(toks) < 7 or not re.match(r"^\d{1,2}/\d{2}/\d$", toks[0]):
         return None
     acct_idx = None
     for i in range(1, min(len(toks), 5)):
-        if re.match(r"^U\d$", toks[i]):
+        if re.match(r"^[A-Z]\d$", toks[i]):
             acct_idx = i
             break
     if acct_idx is None or acct_idx + 2 >= len(toks):
@@ -125,6 +171,110 @@ def _parse_daily_open_position_line(line: str) -> dict | None:
     qty_tok = toks[acct_idx + 1]
     if not re.match(r"^[\d,]+$", qty_tok):
         return None
+
+    currency_idx = None
+    for i in range(len(toks)-1, acct_idx+2, -1):
+        if re.match(r"^[A-Z]{2}$", toks[i]):
+            currency_idx = i
+            break
+    if currency_idx is None:
+        return None
+
+    amount = drcr = None
+    if currency_idx + 1 < len(toks):
+        amount, drcr = _split_amount_drcr(toks[currency_idx + 1])
+
+    if currency_idx >= 2 and FRACTION_RE.match(toks[currency_idx - 1]):
+        price_tokens = toks[currency_idx-2:currency_idx]
+        price_start = currency_idx - 2
+    else:
+        price_tokens = [toks[currency_idx - 1]]
+        price_start = currency_idx - 1
+    price = _parse_price_token(price_tokens)
+    if price is None:
+        return None
+
+    # Optional status token immediately before price, e.g. "r".
+    pre_price = toks[price_start - 1] if price_start - 1 > acct_idx else None
+    if pre_price and re.match(r"^[A-Za-z]$", pre_price) and pre_price.upper() not in MONTHS:
+        st = pre_price
+        desc_tokens = toks[acct_idx + 2:price_start-1]
+    else:
+        st = None
+        desc_tokens = toks[acct_idx + 2:price_start]
+    if not desc_tokens:
+        return None
+
+    contract_month = contract_year = option_type = None
+    # Options may use C/P or CALL/PUT before the month.
+    if desc_tokens[0] in {"CALL", "PUT", "C", "P"} and len(desc_tokens) >= 4:
+        option_type = "CALL" if desc_tokens[0] in {"CALL", "C"} else "PUT"
+        contract_month = desc_tokens[1]
+        contract_year = desc_tokens[2]
+        contract_description = " ".join(desc_tokens)
+    elif len(desc_tokens) >= 2 and re.match(r"^[A-Z]{3}$", desc_tokens[0]) and re.match(r"^\d{2}$", desc_tokens[1]):
+        contract_month = desc_tokens[0]
+        contract_year = desc_tokens[1]
+        contract_description = " ".join(desc_tokens)
+    else:
+        contract_description = " ".join(desc_tokens)
+
+    return {
+        "trade_date": toks[0],
+        "card": " ".join(toks[1:acct_idx]) or None,
+        "account_type": toks[acct_idx],
+        "quantity": _to_num(qty_tok),
+        "contract_month": contract_month,
+        "contract_year": contract_year,
+        "contract_description": contract_description,
+        "option_type_raw": option_type,
+        "st": st,
+        "price": price,
+        "price_text": " ".join(price_tokens),
+        "currency": toks[currency_idx],
+        "amount": amount,
+        "drcr": drcr,
+    }
+
+def _parse_daily_open_position_line(line: str, raw_line: str | None = None) -> dict | None:
+    toks = line.split()
+    if len(toks) < 9 or not re.match(r"^\d{1,2}/\d{2}/\d$", toks[0]):
+        return None
+    acct_idx = None
+    for i in range(1, min(len(toks), 5)):
+        if re.match(r"^[A-Z]\d$", toks[i]):
+            acct_idx = i
+            break
+    if acct_idx is None or acct_idx + 2 >= len(toks):
+        return None
+    qty_tok = toks[acct_idx + 1]
+    if not re.match(r"^[\d,]+$", qty_tok):
+        return None
+
+    # Determine whether the quantity is in the LONG or SHORT printed column.
+    # The normalized text loses fixed-width spacing, so use raw_line when available.
+    # Classic StoneX daily header columns are approximately:
+    # LONG starts near col 25, SHORT near col 39, CONTRACT near col 50.
+    side = None
+    long_qty = None
+    short_qty = None
+    if raw_line:
+        qty_match = re.search(r"^\s*\d{1,2}/\d{2}/\d\s+(?:[A-Z0-9]+\s+)?[A-Z]\d\s+(?P<qty>\d[\d,]*)\s+", raw_line)
+        if qty_match:
+            qty_start = qty_match.start("qty")
+            # If the quantity is right-aligned in the SHORT column, its start is usually
+            # well past the midpoint between LONG and SHORT labels.
+            if qty_start >= 34:
+                side = "Short"
+                short_qty = _to_num(qty_tok)
+            else:
+                side = "Long"
+                long_qty = _to_num(qty_tok)
+    if side is None:
+        # Fallback keeps backward compatibility for normalized-only lines.
+        side = None
+        long_qty = None
+        short_qty = None
     currency_idx = None
     for i in range(len(toks)-2, acct_idx+2, -1):
         if re.match(r"^[A-Z]{2}$", toks[i]):
@@ -148,7 +298,7 @@ def _parse_daily_open_position_line(line: str) -> dict | None:
     # others put the product symbol there (e.g., SCM TSR20RUBBR 210.0 US 1,020.00DR).
     # Treat the pre-price token as status only when it looks like a short code.
     pre_price = toks[price_start - 1] if price_start - 1 > acct_idx else None
-    if pre_price and re.match(r"^[A-Z]{1,3}$", pre_price):
+    if pre_price and re.match(r"^[A-Za-z]$", pre_price):
         st = pre_price
         desc_tokens = toks[acct_idx + 2:price_start-1]
     else:
@@ -171,6 +321,7 @@ def _parse_daily_open_position_line(line: str) -> dict | None:
     return {
         "trade_date": toks[0], "card": " ".join(toks[1:acct_idx]) or None,
         "account_type": toks[acct_idx], "quantity": _to_num(qty_tok),
+        "long": long_qty, "short": short_qty, "side": side,
         "contract_month": contract_month, "contract_year": contract_year,
         "contract_description": contract_description, "option_type_raw": option_type,
         "st": st, "price": price, "price_text": " ".join(price_tokens),
@@ -637,12 +788,71 @@ def _parse_lme_open_positions_from_lines(lines: list[str], stmt_date: str | None
         i += 1
     return rows
 
+
+
+
+def _is_open_position_non_position_line(line: str) -> bool:
+    """Skip header/footer/subtotal and non-futures cash collateral lines inside OPEN POSITIONS.
+
+    Some StoneX daily statements print USTB/T-bill collateral lines in the OPEN
+    POSITIONS section, for example:
+        6/20/5 U1 300,000 USTB DUE 9/18/2025 US 296,823.75CR
+    These are not futures/options position rows and should not be logged as parser
+    exceptions.
+    """
+    s = " ".join(str(line or "").strip().split())
+    if not s:
+        return True
+    u = s.upper()
+    skip_tokens = (
+        "OPEN POSITIONS",
+        "CONTRACT DESCRIPTION-OPEN",
+        "CONTINUED",
+        "ACCOUNT TOTAL",
+        "TOTAL",
+        "PAGE",
+        "STATEMENT",
+        "BROUGHT FORWARD",
+        "CARRIED FORWARD",
+        "TRADE CARD",
+        "TRADE AT",
+        "AVG LONG",
+        "AVG SHORT",
+        "S.P.",
+        "CLOSE",
+    )
+    if any(tok in u for tok in skip_tokens):
+        return True
+    # Treasury bill/cash collateral line, not a futures/options open position.
+    if re.match(r"^\d{1,2}/\d{2}/\d\s+(?:[A-Z0-9]+\s+)?[A-Z]\d\s+[\d,]+\s+USTB\s+DUE\s+", u):
+        return True
+    # Do not try to parse non-position lines as position rows.
+    if not re.match(r"^\d{1,2}/\d{2}/\d\b", s):
+        return True
+    if len(s.split()) < 8:
+        return True
+    return False
+
+def _is_card_continuation_line(line: str) -> bool:
+    """True for the trade/card id printed on the line after a StoneX daily row."""
+    s = str(line or "").strip()
+    if not s:
+        return False
+    if re.match(r"^\d{1,2}/\d{2}/\d\s+", s):
+        return False
+    if any(k in s for k in ["AVG LONG", "AVG SHORT", "CLOSE", "LTD-", "EX-", "DQ", "GROSS PROFIT"]):
+        return False
+    if s.startswith("*") or s.startswith("-") or s.startswith("TRADE "):
+        return False
+    return bool(re.match(r"^[A-Z][A-Z0-9]{3,}$", s))
+
 def extract(pdf_bytes: bytes, include_open_positions: bool = True) -> Dict[str, pd.DataFrame]:
     if looks_like_monthly_statement(pdf_bytes):
         return extract_monthly(pdf_bytes, include_open_positions=include_open_positions)
 
     executed: List[dict] = []
     purchase_sale: List[dict] = []
+    closed_positions: List[dict] = []
     receives_delivers: List[dict] = []
     journals: List[dict] = []
     open_positions: List[dict] = []
@@ -650,62 +860,115 @@ def extract(pdf_bytes: bytes, include_open_positions: bool = True) -> Dict[str, 
     exceptions: List[dict] = []
 
     pending_lme_avg: dict | None = None
+    last_purchase_sale_contract: dict | None = None
 
     for page_no, text in pdf_text(pdf_bytes):
         stmt_date = _statement_date(text)
         account = _account_number(text)
         section: str | None = None
         saw_stmt = bool(stmt_date)
-        if include_open_positions and "CONTRACT DESCRIPTION-OPEN" in text:
-            section = "open_positions"
+        # Do not enter the OPEN section just because the page contains the OPEN header;
+        # a page can contain the tail of P&S before the OPEN header. We switch to
+        # open_positions only when the header/title line itself is reached below.
 
         normalized_lines = [" ".join(raw.strip().split()) for raw in text.splitlines() if " ".join(raw.strip().split())]
         if include_open_positions and ("LME AVERAGE OPEN POSITIONS" in text or "FUTURES / OPTIONS OPEN POSITIONS" in text):
             open_positions.extend(_parse_lme_open_positions_from_lines(normalized_lines, stmt_date, account, page_no))
 
-        for raw in text.splitlines():
+        raw_lines = text.splitlines()
+        i = 0
+        while i < len(raw_lines):
+            raw = raw_lines[i]
             line = " ".join(raw.strip().split())
             if not line:
+                i += 1
                 continue
 
             if "THE FOLLOWING TRADES HAVE BEEN MADE" in line:
                 section = "executed"
+                i += 1
                 continue
             if "P U R C H A S E" in line and "S A L E" in line:
                 section = "purchase_sale"
+                i += 1
+                continue
+            if "CONTRACT DESCRIPTION-P&S" in line:
+                section = "purchase_sale"
+                i += 1
                 continue
             if "THE FOLLOWING ITEMS HAVE BEEN RECEIVED/DELIVERED" in line:
                 section = "receives_delivers"
+                i += 1
                 continue
             if "THE FOLLOWING JOURNAL ENTRIES" in line:
                 section = "journal"
+                i += 1
                 continue
             if "FUTURES / OPTIONS OPEN POSITIONS" in line:
                 section = "lme_fut_opt_open" if include_open_positions else None
+                i += 1
                 continue
             if "LME AVERAGE OPEN POSITIONS" in line:
                 section = "lme_average_open" if include_open_positions else None
+                i += 1
                 continue
-            if "O P E N P O S I T I O N S" in line:
+            if "O P E N P O S I T I O N S" in line or "CONTRACT DESCRIPTION-OPEN" in line:
                 section = "open_positions" if include_open_positions else None
+                i += 1
                 continue
             if line.startswith("*USD") or line.startswith("**TOTAL") or line.startswith("MARGIN CALL") or line.startswith("SUMMARY"):
                 section = None
+                i += 1
                 continue
             if line.startswith("-------") or line.startswith("TRADE CARD") or line.startswith("TRADE AT"):
+                i += 1
                 continue
 
             if section in {"executed", "purchase_sale"}:
                 match = TRADE_LINE_RE.match(line)
-                if match:
-                    row = _base_row(match.groupdict(), stmt_date, account, page_no, line)
+                parsed_trade = match.groupdict() if match else _parse_daily_trade_or_ps_line(line)
+                if parsed_trade:
+                    row = _base_row(parsed_trade, stmt_date, account, page_no, line)
                     row["source_section"] = "Executed Trades" if section == "executed" else "Purchase & Sale"
                     row["side"] = _side_from_section(section, row.get("quantity"))
-                    (executed if section == "executed" else purchase_sale).append(row)
+                    # Classic daily statements print the actual card/trade id on the next line.
+                    if i + 1 < len(raw_lines):
+                        next_line = " ".join(raw_lines[i + 1].strip().split())
+                        if _is_card_continuation_line(next_line):
+                            row["card"] = next_line
+                            row["trade_id"] = next_line
+                            row["source_line"] = f"{line} | {next_line}"
+                            i += 1
+                    if section == "purchase_sale":
+                        parsed_contract = parse_contract_product(row.get("contract_description"))
+                        for meta_col, meta_val in parsed_contract.items():
+                            row.setdefault(meta_col, meta_val)
+                        last_purchase_sale_contract = row.copy()
+                        purchase_sale.append(row)
+                    else:
+                        executed.append(row)
+                elif section == "purchase_sale" and "GROSS PROFIT OR LOSS" in line:
+                    closed = _parse_closed_position_gross_line(line, last_purchase_sale_contract)
+                    if closed:
+                        row = _base_row(closed, stmt_date, account, page_no, line)
+                        row["realized_pnl"] = closed.get("realized_pnl")
+                        row["amount_signed"] = closed.get("amount_signed")
+                        row["pnl_view"] = "Closed Position Detail"
+                        parsed_contract = parse_contract_product(row.get("contract_description"))
+                        for meta_col, meta_val in parsed_contract.items():
+                            if row.get(meta_col) in (None, "", "Other"):
+                                row[meta_col] = meta_val
+                        closed_positions.append(row)
+                    notes.append({"statement_date": stmt_date, "account_number": account, "page": page_no, "section": section, "text": line})
                 elif any(keyword in line for keyword in FEE_OR_AVG_KEYWORDS):
                     notes.append({"statement_date": stmt_date, "account_number": account, "page": page_no, "section": section, "text": line})
+                elif _is_card_continuation_line(line):
+                    pass
                 elif re.match(r"^\d{1,2}/\d{2}/\d\s+", line):
-                    exceptions.append({"statement_date": stmt_date, "account_number": account, "page": page_no, "section": section, "reason": "Unmatched trade-like line", "source_line": line})
+                    # Confirmation/P&S trade rows in daily statements are often split across
+                    # multiple fixed-width lines. They are not Open Positions, so do not
+                    # flood Exceptions with harmless confirmation rows.
+                    notes.append({"statement_date": stmt_date, "account_number": account, "page": page_no, "section": section, "text": line})
 
             elif section == "receives_delivers":
                 match = RD_LINE_RE.match(line)
@@ -756,21 +1019,44 @@ def extract(pdf_bytes: bytes, include_open_positions: bool = True) -> Dict[str, 
                         pass
 
             elif section == "open_positions" and include_open_positions:
-                parsed = _parse_daily_open_position_line(line)
+                parsed = _parse_daily_open_position_line(line, raw)
                 if parsed:
                     row = _base_row(parsed, stmt_date, account, page_no, line)
                     row["market_value_signed"] = _signed(row.get("market_value"), row.get("drcr"))
+                    # Classic daily statements print the actual card/trade id on the next line.
+                    # Attach it to the position row and skip that continuation line.
+                    if i + 1 < len(raw_lines):
+                        next_line = " ".join(raw_lines[i + 1].strip().split())
+                        if _is_card_continuation_line(next_line):
+                            row["card"] = next_line
+                            row["trade_id"] = next_line
+                            row["source_line"] = f"{line} | {next_line}"
+                            i += 1
                     open_positions.append(row)
                 else:
                     match = OPEN_POSITION_LINE_RE.match(line)
                     if match:
                         row = _base_row(match.groupdict(), stmt_date, account, page_no, line)
                         row["market_value_signed"] = _signed(row.get("market_value"), row.get("drcr"))
+                        if i + 1 < len(raw_lines):
+                            next_line = " ".join(raw_lines[i + 1].strip().split())
+                            if _is_card_continuation_line(next_line):
+                                row["card"] = next_line
+                                row["trade_id"] = next_line
+                                row["source_line"] = f"{line} | {next_line}"
+                                i += 1
                         open_positions.append(row)
-                    elif any(keyword in line for keyword in ["AVG LONG", "AVG SHORT", "CLOSE", "S.P."]):
+                    elif _is_open_position_non_position_line(line):
+                        # Header/footer/subtotal lines and USTB/cash-collateral rows are not
+                        # futures/options open positions, so keep them out of Exceptions.
                         notes.append({"statement_date": stmt_date, "account_number": account, "page": page_no, "section": section, "text": line})
+                    elif _is_card_continuation_line(line):
+                        # Card/trade-id continuation lines are attached to the previous parsed row.
+                        pass
                     elif re.match(r"^\d{1,2}/\d{2}/\d\s+", line):
                         exceptions.append({"statement_date": stmt_date, "account_number": account, "page": page_no, "section": section, "reason": "Unmatched open position line", "source_line": line})
+
+            i += 1
 
         if not saw_stmt:
             exceptions.append({"statement_date": None, "account_number": account, "page": page_no, "section": None, "reason": "Statement date not found", "source_line": ""})
@@ -779,9 +1065,9 @@ def extract(pdf_bytes: bytes, include_open_positions: bool = True) -> Dict[str, 
     # column header are included. Avoid duplicates by source line + page.
     backstop_positions = _daily_open_positions_backstop(pdf_bytes, include_open_positions=include_open_positions)
     if backstop_positions:
-        existing_keys = {(r.get("page"), r.get("source_line")) for r in open_positions}
+        existing_keys = {(r.get("page"), str(r.get("source_line", "")).split(" | ")[0]) for r in open_positions}
         for r in backstop_positions:
-            key = (r.get("page"), r.get("source_line"))
+            key = (r.get("page"), str(r.get("source_line", "")).split(" | ")[0])
             if key not in existing_keys:
                 open_positions.append(r)
                 existing_keys.add(key)
@@ -792,6 +1078,7 @@ def extract(pdf_bytes: bytes, include_open_positions: bool = True) -> Dict[str, 
         "Receives Delivers": pd.DataFrame(receives_delivers),
         "Journal Entries": pd.DataFrame(journals),
         "Realized Gain and Loss": pd.DataFrame(),
+        "Closed Positions": pd.DataFrame(closed_positions),
         "Realized PNL Summary": _parse_realized_pnl_summary_from_text(pdf_bytes),
         "Open Positions": pd.DataFrame(open_positions),
         "Notes": pd.DataFrame(notes),
@@ -885,46 +1172,104 @@ def grouped_trades(tables: Dict[str, pd.DataFrame]) -> pd.DataFrame:
 
 
 
+def _normalize_product_from_description(product_text: str, full_desc: str = "") -> str:
+    """Normalize product text from PDF contract description into business product name."""
+    raw = " ".join(str(product_text or "").upper().replace("  ", " ").split())
+    full = " ".join(str(full_desc or "").upper().replace("  ", " ").split())
+    search = f"{raw} {full}"
+
+    product_mapping = {
+        "COFFEE": "Coffee",
+        "COFFEE C": "Coffee",
+        "COFFEE P": "Coffee",
+        "EAU WHEAT": "Wheat",
+        "WHEAT": "Wheat",
+        "BARLEY": "Barley",
+        "SPI 200": "SPI 200",
+        "10Y T-BOND": "10Y T-BOND",
+        "3Y T-BOND": "3Y T-BOND",
+        "NIKKEI 225": "NIKKEI 225",
+        "IRON ORE F": "Iron Ore",
+        "IRON ORE": "Iron Ore",
+        "SKMILK": "Skim Milk",
+        "SKIM MILK": "Skim Milk",
+        "WHOLE MILK": "Whole Milk",
+        "WHMILK": "Whole Milk",
+        "USD/KRW": "USD/KRW",
+        "INR/USD": "INR/USD",
+        "TSR20RUBBR": "TSR20 Rubber",
+        "RUBBR": "Rubber",
+        "CORN": "Corn",
+        "SOYBEAN": "Soybean",
+        "SOYBEANS": "Soybean",
+    }
+    for key, value in product_mapping.items():
+        if key in search:
+            return value
+
+    # Remove common option markers, C/P option flags, strike prices, and suffixes such as SE
+    # so examples like "COFFEE C 2750 SE" and "COFFEE C 3250 SE" normalize to Coffee.
+    cleaned = re.sub(r"\b(EURO\s+OPTION|OPTION|CALL|PUT|O)\b", " ", raw, flags=re.I)
+    cleaned = re.sub(r"\b(C|P)\s+\d+(?:\.\d+)?\b", " ", cleaned, flags=re.I)
+    cleaned = re.sub(r"\bSE\b", " ", cleaned, flags=re.I)
+    cleaned = re.sub(r"\b\d+(?:\.\d+)?\b\s*$", "", cleaned).strip()
+    return " ".join(cleaned.split()) or raw or "Unknown"
+
+
 def parse_contract_product(desc: str | None) -> dict:
-    """Parse a StoneX contract description into grouping fields."""
+    """Parse a StoneX contract description into grouping fields.
+
+    The PDF contract description is the best source for product identity.
+    Example: "MAY 26 ASX EAU WHEAT" maps to exchange=ASX and product=Wheat.
+    """
     desc = "" if desc is None else str(desc).strip()
-    exchanges = "LME|SCM|CBOT|CBT|NYMEX|CME|ICE|MGEX"
-    if desc.upper().startswith("LME "):
-        parts = desc.split()
-        exchange = "LME"
-        # Last token is usually metal currency (USD/EUR); keep it as unit/currency and exclude from product name.
-        unit = parts[-1] if len(parts) > 2 and re.match(r"^[A-Z]{3}|\$$", parts[-1]) else None
-        product_name = " ".join(parts[1:-1] if unit else parts[1:])
-        return {"product": f"LME {product_name}".strip(), "exchange": exchange, "product_name": product_name, "strike": None, "option_type": "Other", "unit": unit}
-    if desc.upper().startswith("SCM "):
-        parts = desc.split(maxsplit=1)
-        product_name = parts[1] if len(parts) > 1 else ""
-        return {"product": f"SCM {product_name}".strip(), "exchange": "SCM", "product_name": product_name, "strike": None, "option_type": "Other", "unit": None}
-    m = re.search(rf"\b({exchanges})\s+(.+?)(?=\s+\d+(?:\.\d+)?)", desc)
-    if m:
-        exchange = m.group(1)
-        product_name = " ".join(m.group(2).split())
-        product = f"{exchange} {product_name}".strip()
-    else:
-        m2 = re.search(rf"\b({exchanges})\s+([A-Za-z ]+)", desc)
-        exchange = m2.group(1) if m2 else None
-        product_name = " ".join(m2.group(2).split()) if m2 else None
-        product = f"{exchange} {product_name}".strip() if m2 else "Unknown"
+    upper = " ".join(desc.upper().split())
+
+    exchanges = "LME|SCM|CBOT|CBT|NYMEX|CME|ICE|MGEX|ASX|SFE|SGX|KFX|NZF|ABX|TOCOM"
+    months = "JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC"
+
+    option_type = "Call" if re.search(r"\b(CALL|C)\b", upper) else ("Put" if re.search(r"\b(PUT|P)\b", upper) else "Other")
 
     strike_value = None
-    strike_match = re.search(r"\b(\d+(?:\.\d+)?)\s+Euro\s+Option\b", desc)
-    if strike_match:
-        strike_value = _num_any(strike_match.group(1))
-    elif re.match(r"^(CALL|PUT)\b", desc, re.I):
-        mstrike = re.search(r"\b(CBT|CBOT|NYMEX|CME|ICE|MGEX)\s+[A-Z ]+\s+(\d+(?:\.\d+)?)\b", desc, re.I)
-        if mstrike:
-            strike_value = _num_any(mstrike.group(2))
+    strike_patterns = [
+        r"\b(?:C|P|CALL|PUT)\s+(\d+(?:\.\d+)?)\b",
+        r"\b(\d+(?:\.\d+)?)\s+Euro\s+Option\b",
+        rf"\b(?:{exchanges})\b.+?\b(\d+(?:\.\d+)?)\b(?:\s+[A-Z]{{1,4}})?\s*$",
+    ]
+    for pat in strike_patterns:
+        mstrike = re.search(pat, desc, re.I)
+        if mstrike and option_type != "Other":
+            strike_value = _num_any(mstrike.group(1))
+            break
 
-    option_type = "Call" if re.search(r"\bCall\b", desc, re.I) else ("Put" if re.search(r"\bPut\b", desc, re.I) else "Other")
-    unit_match = re.search(r"\bUSD/([A-Z]+)\b", desc)
+    # Special handling for LME rows.
+    if upper.startswith("LME "):
+        parts = desc.split()
+        exchange = "LME"
+        unit = parts[-1] if len(parts) > 2 and re.match(r"^[A-Z]{3}|\$$", parts[-1]) else None
+        raw_product = " ".join(parts[1:-1] if unit else parts[1:])
+        product_name = _normalize_product_from_description(raw_product, desc)
+        return {"product": product_name, "exchange": exchange, "product_name": product_name, "strike": strike_value, "option_type": option_type, "unit": unit}
+
+    # Remove leading CALL/PUT then leading month/year before detecting exchange.
+    work = re.sub(r"^(CALL|PUT|C|P)\s+", "", upper, flags=re.I).strip()
+    work = re.sub(rf"^(?:{months})\s+\d{{2,4}}\s+", "", work, flags=re.I).strip()
+
+    m = re.search(rf"\b({exchanges})\b\s+(.+)$", work, re.I)
+    if m:
+        exchange = m.group(1).upper()
+        product_text = m.group(2).strip()
+    else:
+        # Fallback for older CME/CBOT descriptions where price follows product.
+        m2 = re.search(rf"\b({exchanges})\b\s+(.+?)(?=\s+\d+(?:\.\d+)?(?:\s|$))", upper, re.I)
+        exchange = m2.group(1).upper() if m2 else None
+        product_text = m2.group(2).strip() if m2 else upper
+
+    unit_match = re.search(r"\bUSD/([A-Z]+)\b", upper)
+    product_name = _normalize_product_from_description(product_text, desc)
 
     return {
-        "product": product,
+        "product": product_name,
         "exchange": exchange,
         "product_name": product_name,
         "strike": strike_value,
@@ -995,6 +1340,14 @@ def _prepared_positions_for_grouping(tables: Dict[str, pd.DataFrame]) -> tuple[p
     return df, price_col, mv_col
 
 
+
+def _unique_or_multiple(series: pd.Series):
+    vals = [v for v in series.dropna().unique().tolist() if str(v).strip() != "" and str(v).strip().lower() != "none"]
+    if not vals:
+        return None
+    return vals[0] if len(vals) == 1 else "Multiple"
+
+
 def _group_prepared_positions(df: pd.DataFrame, group_cols: list[str], price_col: str | None, mv_col: str | None) -> pd.DataFrame:
     if df is None or df.empty:
         return pd.DataFrame()
@@ -1013,6 +1366,16 @@ def _group_prepared_positions(df: pd.DataFrame, group_cols: list[str], price_col
         "net_qty": "sum",
         "_position_rows": "sum",
     }
+    # Preserve useful descriptor fields on grouped rows when they are unique inside the group.
+    descriptor_cols = [
+        "exchange", "product_name", "contract_description", "currency", "unit",
+        "statement_date", "account_number", "ref_month", "contract_month", "contract_year",
+        "option_type", "option_type_raw", "strike", "source_system", "sourceSystem",
+        "settlement_date", "delivery_date", "end_date", "expiry_date", "closing_price", "settlement_price"
+    ]
+    for desc_col in descriptor_cols:
+        if desc_col in df.columns and desc_col not in group_cols and desc_col not in agg:
+            agg[desc_col] = _unique_or_multiple
     if price_col:
         df["_weighted_price_qty"] = df[price_col].fillna(0) * df["net_qty"].abs()
         agg["_weighted_price_qty"] = "sum"
@@ -1063,6 +1426,309 @@ def grouped_positions_custom(tables: Dict[str, pd.DataFrame], group_cols: list[s
     return _group_prepared_positions(df, group_cols, price_col, mv_col)
 
 
+
+STANDARD_POSITION_COLUMNS = [
+    "Contract Description",
+    "Product",
+    "Contract Name",
+    "Exchange",
+    "Currency",
+    "expiryDate",
+    "settlementPrice",
+    "Position ID",
+    "Trade ID",
+    "Account Number",
+    "Net Quantity",
+    "Last Update",
+    "Contract Date",
+    "Contract Month/Year",
+    "Avg Fill Price",
+    "Delta",
+    "Call/Put",
+    "strikePrice",
+    "sourceSystem",
+    "Unrealised PNL (OTE)",
+    "Market Value",
+]
+
+
+OPEN_POSITION_COLUMNS = [
+    "Trade ID",
+    "Product",
+    "Contract Description",
+    "Exchange",
+    "Currency",
+    "Account Number",
+    "Quantity",
+    "Contract Date",
+    "Contract Month/Year",
+    "Avg Fill Price",
+    "Call/Put",
+    "strikePrice",
+    "Unrealised PNL (OTE)",
+]
+
+GROUPED_POSITION_COLUMNS = [
+    "Product",
+    "Contract Month/Year",
+    "Call/Put",
+    "strikePrice",
+    "Account Number",
+    "Net Quantity",
+    "Avg Fill Price",
+    "Unrealised PNL (OTE)",
+]
+
+
+def _first_existing(df: pd.DataFrame, cols: list[str], default=None):
+    for col in cols:
+        if col in df.columns:
+            return df[col]
+    return pd.Series([default] * len(df), index=df.index)
+
+
+def _combine_month_year(df: pd.DataFrame) -> pd.Series:
+    if "ref_month" in df.columns:
+        return df["ref_month"]
+    if "contract_month" in df.columns and "contract_year" in df.columns:
+        return df["contract_month"].astype(str).str.strip() + "-" + df["contract_year"].astype(str).str.strip()
+    if "contract_month" in df.columns:
+        return df["contract_month"]
+    return pd.Series([None] * len(df), index=df.index)
+
+
+def _compute_net_qty_for_view(df: pd.DataFrame) -> pd.Series:
+    if "net_qty" in df.columns:
+        return pd.to_numeric(df["net_qty"], errors="coerce")
+    if "long_qty" in df.columns or "short_qty" in df.columns:
+        long_qty = pd.to_numeric(df.get("long_qty", 0), errors="coerce").fillna(0)
+        short_qty = pd.to_numeric(df.get("short_qty", 0), errors="coerce").fillna(0)
+        return long_qty - short_qty
+    if "long" in df.columns or "short" in df.columns:
+        long_qty = pd.to_numeric(df.get("long", 0), errors="coerce").fillna(0)
+        short_qty = pd.to_numeric(df.get("short", 0), errors="coerce").fillna(0)
+        return long_qty - short_qty
+    if "quantity" in df.columns:
+        return pd.to_numeric(df["quantity"], errors="coerce")
+    return pd.Series([None] * len(df), index=df.index)
+
+
+def _direction_from_net_qty(net_qty: pd.Series) -> pd.Series:
+    def _direction(v):
+        try:
+            if pd.isna(v):
+                return None
+            if float(v) > 0:
+                return "Long"
+            if float(v) < 0:
+                return "Short"
+            return "Flat"
+        except Exception:
+            return None
+    return net_qty.apply(_direction)
+
+
+
+def _pdf_contract_description_for_view(df: pd.DataFrame) -> pd.Series:
+    """Return the PDF contract-description text for display.
+
+    In the StoneX PDF, the CONTRACT DESCRIPTION column includes the contract
+    month/year plus product text (for example, "JUN 26 SFE SPI 200").
+    Internally the parser stores month/year separately for many futures rows,
+    so this reconstructs the PDF-facing value for Contract Description.
+    """
+    if df is None or df.empty:
+        return pd.Series(dtype=object)
+
+    desc = _first_existing(df, ["contract_description", "product", "product_name"], default=None)
+    product = _first_existing(df, ["product", "product_name"], default=None)
+    month = _first_existing(df, ["contract_month"], default=None)
+    year = _first_existing(df, ["contract_year"], default=None)
+    ref_month = _first_existing(df, ["ref_month", "Contract Month/Year"], default=None)
+
+    def clean(v):
+        if v is None or (isinstance(v, float) and pd.isna(v)):
+            return ""
+        t = str(v).strip()
+        return "" if t.lower() in {"nan", "none", "nat"} else t
+
+    out = []
+    for idx in df.index:
+        d = clean(desc.loc[idx] if idx in desc.index else None)
+        p = clean(product.loc[idx] if idx in product.index else None)
+        if d.lower() == "multiple" or not d:
+            d = p
+
+        m = clean(month.loc[idx] if idx in month.index else None).upper()
+        y = clean(year.loc[idx] if idx in year.index else None)
+        r = clean(ref_month.loc[idx] if idx in ref_month.index else None).upper().replace("/", "-")
+
+        if (not m or not y or m == "MULTIPLE" or y == "MULTIPLE") and re.match(r"^[A-Z]{3}-\d{2}$", r):
+            m, y = r.split("-", 1)
+
+        already_has_month = bool(re.match(r"^(CALL|PUT|C|P)?\s*[A-Z]{3}\s+\d{2}\b", d, re.I))
+        if m and y and re.match(r"^[A-Z]{3}$", m) and re.match(r"^\d{2}$", y) and not already_has_month:
+            d = f"{m} {y} {d}".strip()
+        out.append(d or None)
+    return pd.Series(out, index=df.index)
+
+def standard_position_view_from_df(df: pd.DataFrame) -> pd.DataFrame:
+    """Map raw or grouped position rows to the standard Positions schema requested by the user.
+
+    Mapping assumptions:
+    - Contract Description = the exact PDF contract description, reconstructed as month/year + product when needed.
+    - Product = normalized product name used for grouping/risk views.
+    - Contract Name = same PDF contract description value retained only for compatibility.
+    - expiryDate = settlement/delivery/end date where available.
+    - settlementPrice = settlement/closing price where available; blank when the PDF has no row-level settlement price.
+    - Position ID = card/trade id/global id where available.
+    - Trade ID = card from the PDF when available, falling back to trade_id/global_id.
+    - Unrealised PNL (OTE) = signed market value when available.
+    """
+    if df is None or df.empty:
+        return pd.DataFrame(columns=STANDARD_POSITION_COLUMNS)
+
+    out_source = df.copy()
+
+    # Ensure parsed metadata exists for raw rows.
+    if "contract_description" in out_source.columns:
+        parsed = out_source["contract_description"].apply(lambda x: pd.Series(parse_contract_product(x)))
+        for col in parsed.columns:
+            if col not in out_source.columns:
+                out_source[col] = parsed[col]
+            else:
+                current = out_source[col]
+                missing = current.isna() | (current.astype(str).str.strip() == "") | (current.astype(str).str.lower() == "none") | (current.astype(str).str.lower() == "unknown")
+                out_source[col] = current.where(~missing, parsed[col])
+
+    net_qty = _compute_net_qty_for_view(out_source)
+    market_value_signed = _first_existing(out_source, ["market_value_signed", "unrealized_pnl", "open_trade_equity", "market_value"])
+    market_value_display = _first_existing(out_source, ["market_value", "market_value_signed", "unrealized_pnl", "open_trade_equity"])
+
+    contract_description = _pdf_contract_description_for_view(out_source)
+    product = _first_existing(out_source, ["product", "product_name"])
+    contract_name = contract_description
+    exchange = _first_existing(out_source, ["exchange"])
+    currency = _first_existing(out_source, ["currency", "unit"])
+    expiry_date = _first_existing(out_source, ["expiryDate", "expiry_date", "settlement_date", "delivery_date", "end_date"])
+    settlement_price = _first_existing(out_source, ["settlementPrice", "settlement_price", "closing_price"])
+    position_id = _first_existing(out_source, ["card", "trade_id", "global_id", "position_id"])
+    trade_id = _first_existing(out_source, ["card", "trade_id", "global_id", "position_id"])
+    account_number = _first_existing(out_source, ["account_number"])
+    last_update = _first_existing(out_source, ["last_update", "statement_date"])
+    contract_date = _first_existing(out_source, ["trade_date_iso", "trade_date", "contract_date"])
+    month_year = _combine_month_year(out_source)
+    avg_fill_price = _first_existing(out_source, ["avg_trade_price", "trade_price", "price"])
+    delta = _first_existing(out_source, ["delta", "Delta"])
+    call_put = _first_existing(out_source, ["option_type", "option_type_raw", "call_put"])
+    strike = _first_existing(out_source, ["strike", "strikePrice"])
+    source_system = _first_existing(out_source, ["sourceSystem", "source_system"])
+    if source_system.isna().all() if hasattr(source_system, 'isna') else False:
+        source_system = pd.Series(["StoneX"] * len(out_source), index=out_source.index)
+    direction = _first_existing(out_source, ["direction", "side"])
+    if direction.isna().all() if hasattr(direction, 'isna') else False:
+        direction = _direction_from_net_qty(net_qty)
+
+    out = pd.DataFrame({
+        "Contract Description": contract_description,
+        "Product": product,
+        "Contract Name": contract_name,
+        "Exchange": exchange,
+        "Currency": currency,
+        "expiryDate": expiry_date,
+        "settlementPrice": settlement_price,
+        "Position ID": position_id,
+        "Trade ID": trade_id,
+        "Account Number": account_number,
+        "Net Quantity": net_qty,
+        "Last Update": last_update,
+        "Contract Date": contract_date,
+        "Contract Month/Year": month_year,
+        "Avg Fill Price": avg_fill_price,
+        "Delta": delta,
+        "Call/Put": call_put,
+        "strikePrice": strike,
+        "sourceSystem": source_system,
+        "Direction": direction,
+        "Unrealised PNL (OTE)": market_value_signed,
+        "Market Value": market_value_display,
+    })
+    return out[STANDARD_POSITION_COLUMNS]
+
+
+def open_positions_standard_view(tables: Dict[str, pd.DataFrame]) -> pd.DataFrame:
+    """Open Positions display schema.
+
+    User-facing changes:
+    - Net Quantity is renamed to Quantity.
+    - Contract Description is shown as the PDF-facing instrument detail.
+    - Position ID and Market Value are hidden/removed from this view.
+    - Unrealised PNL (OTE) remains available for position P&L.
+    """
+    df = standard_position_view_from_df(tables.get("Open Positions", pd.DataFrame()))
+    if df is None or df.empty:
+        return pd.DataFrame(columns=OPEN_POSITION_COLUMNS)
+    df = df.rename(columns={"Net Quantity": "Quantity"})
+    df = df.drop(columns=["Position ID", "Market Value", "Contract Name", "Direction"], errors="ignore")
+    # Keep the requested display order and preserve any future extra columns after it.
+    ordered = [c for c in OPEN_POSITION_COLUMNS if c in df.columns]
+    ordered += [c for c in df.columns if c not in ordered]
+    return df[ordered]
+
+
+def grouped_positions_standard_view(tables: Dict[str, pd.DataFrame], group_cols: list[str] | None = None) -> pd.DataFrame:
+    """Return grouped positions in the standard schema.
+
+    Avg Fill Price is weighted by absolute Net Quantity inside _group_prepared_positions.
+    """
+    grouped = grouped_positions_custom(tables, group_cols)
+    df = standard_position_view_from_df(grouped)
+    return df.drop(columns=["Market Value", "Trade ID", "Contract Name", "Position ID", "Contract Description", "Direction"], errors="ignore")
+
+
+def grouped_positions_product_month_auto(tables: Dict[str, pd.DataFrame]) -> pd.DataFrame:
+    """Product + month view that automatically adds strike/call-put only for options.
+
+    Futures/forwards rows group by product + contract month/year.
+    Option rows group by product + contract month/year + call/put + strike.
+    """
+    df, price_col, mv_col = _prepared_positions_for_grouping(tables)
+    if df is None or df.empty:
+        return pd.DataFrame()
+    df = df.copy()
+
+    option_signal = pd.Series(False, index=df.index)
+    if "option_type" in df.columns:
+        option_signal = option_signal | df["option_type"].astype(str).str.lower().isin(["call", "put"])
+    if "option_type_raw" in df.columns:
+        option_signal = option_signal | df["option_type_raw"].astype(str).str.lower().isin(["call", "put"])
+    if "strike" in df.columns:
+        option_signal = option_signal | pd.to_numeric(df["strike"], errors="coerce").notna()
+
+    # Only populate option grouping fields for options. Futures get blanks, so they group only at product/month level.
+    if "option_type" in df.columns:
+        df["option_type"] = df["option_type"].where(option_signal, None)
+    elif "option_type_raw" in df.columns:
+        df["option_type"] = df["option_type_raw"].where(option_signal, None)
+    else:
+        df["option_type"] = None
+
+    if "strike" in df.columns:
+        df["strike"] = df["strike"].where(option_signal, None)
+    else:
+        df["strike"] = None
+
+    group_cols = ["product", "ref_month", "option_type", "strike"]
+    return _group_prepared_positions(df, group_cols, price_col, mv_col)
+
+
+def grouped_positions_product_month_auto_standard_view(tables: Dict[str, pd.DataFrame]) -> pd.DataFrame:
+    """Standard-schema view for the automatic futures/options grouping."""
+    grouped = grouped_positions_product_month_auto(tables)
+    df = standard_position_view_from_df(grouped)
+    return df.drop(columns=["Market Value", "Trade ID", "Contract Name", "Position ID", "Contract Description", "Direction"], errors="ignore")
+
+
 def merge_extracted_tables(tables_list: list[Dict[str, pd.DataFrame]], position_mode: str = "append_all") -> Dict[str, pd.DataFrame]:
     """Merge extracted tables from multiple PDFs.
 
@@ -1070,7 +1736,7 @@ def merge_extracted_tables(tables_list: list[Dict[str, pd.DataFrame]], position_
       - append_all: keep every open-position row from every PDF. This is now the only UI behavior.
     """
     sheet_names = [
-        "Executed Trades", "Purchase & Sale", "Receives Delivers", "Journal Entries",
+        "Executed Trades", "Purchase & Sale", "Closed Positions", "Receives Delivers", "Journal Entries",
         "Realized Gain and Loss", "Realized PNL Summary", "Open Positions", "Notes", "Exceptions"
     ]
     merged: Dict[str, pd.DataFrame] = {}
@@ -1086,7 +1752,7 @@ def merge_extracted_tables(tables_list: list[Dict[str, pd.DataFrame]], position_
         merged[name] = pd.concat(frames, ignore_index=True, sort=False) if frames else pd.DataFrame()
 
     # De-duplicate trades where the same PDF/statement is uploaded twice.
-    for name in ["Executed Trades", "Purchase & Sale", "Receives Delivers", "Journal Entries", "Realized Gain and Loss"]:
+    for name in ["Executed Trades", "Purchase & Sale", "Closed Positions", "Receives Delivers", "Journal Entries", "Realized Gain and Loss"]:
         df = merged.get(name, pd.DataFrame())
         if df.empty:
             continue
@@ -1149,6 +1815,15 @@ def realized_pnl_summary(tables: Dict[str, pd.DataFrame]) -> pd.DataFrame:
         df["pnl_view"] = "Detail"
         frames.append(df)
 
+    closed = tables.get("Closed Positions", pd.DataFrame())
+    if closed is not None and not closed.empty:
+        df = closed.copy()
+        df["source_sheet"] = "Closed Positions"
+        if "realized_pnl" not in df.columns and "amount_signed" in df.columns:
+            df["realized_pnl"] = df["amount_signed"].apply(_num_any)
+        df["pnl_view"] = "Closed Position Detail"
+        frames.append(df)
+
     ps = tables.get("Purchase & Sale", pd.DataFrame())
     if ps is not None and not ps.empty:
         df = ps.copy()
@@ -1157,7 +1832,8 @@ def realized_pnl_summary(tables: Dict[str, pd.DataFrame]) -> pd.DataFrame:
             df["realized_pnl"] = df["amount_signed"].apply(_num_any)
         elif "amount" in df.columns:
             df["realized_pnl"] = [_signed(a, d) for a, d in zip(df.get("amount"), df.get("drcr"))]
-        df["pnl_view"] = "Detail"
+        # Raw P&S rows are useful audit detail but are not the closed-position total rows.
+        df["pnl_view"] = "P&S Trade Detail"
         frames.append(df)
 
     summary = tables.get("Realized PNL Summary", pd.DataFrame())
@@ -1183,8 +1859,9 @@ def realized_pnl_summary(tables: Dict[str, pd.DataFrame]) -> pd.DataFrame:
     wanted = [
         "pnl_view", "statement_date", "account_number", "currency",
         "mtd_realized_pnl", "ytd_realized_pnl", "realized_pnl",
-        "trade_date", "trade_date_iso", "trade_id", "contract_description",
-        "quantity", "long", "short", "trade_price", "price", "cash_flow", "amount_signed",
+        "trade_date", "trade_date_iso", "close_date", "trade_id", "contract_description",
+        "product", "exchange", "ref_month", "option_type", "strike",
+        "quantity", "long", "short", "trade_price", "price", "close_price", "cash_flow", "amount_signed",
         "source_sheet", "source_section", "source_pdf", "page", "source_line"
     ]
     cols = [c for c in wanted if c in detail.columns]
@@ -1194,7 +1871,7 @@ def realized_pnl_summary(tables: Dict[str, pd.DataFrame]) -> pd.DataFrame:
 def statement_dates_by_account(tables: Dict[str, pd.DataFrame]) -> pd.DataFrame:
     """Return statement-date coverage by account for audit after multi-PDF merge."""
     frames = []
-    for name in ["Executed Trades", "Open Positions", "Purchase & Sale", "Receives Delivers", "Realized Gain and Loss", "Realized PNL Summary"]:
+    for name in ["Executed Trades", "Open Positions", "Purchase & Sale", "Closed Positions", "Receives Delivers", "Realized Gain and Loss", "Realized PNL Summary"]:
         df = tables.get(name, pd.DataFrame())
         if df is not None and not df.empty:
             cols = [c for c in ["source_pdf", "account_number", "statement_date"] if c in df.columns]
@@ -1212,12 +1889,16 @@ def to_excel_bytes(tables: Dict[str, pd.DataFrame]) -> bytes:
     ordered = {
         "Summary": tables.get("Summary", pd.DataFrame()),
         "Grouped Trades": grouped_trades(tables),
-        "Grouped Positions": grouped_positions_by_ref_month(tables),
+        "Grouped Positions": grouped_positions_product_month_auto_standard_view(tables),
         "Realized PNL": realized_pnl_summary(tables),
         "Statement Dates": statement_dates_by_account(tables),
     }
     for name, df in tables.items():
-        if name != "Summary":
+        if name == "Summary":
+            continue
+        if name == "Open Positions":
+            ordered[name] = open_positions_standard_view(tables)
+        else:
             ordered[name] = df
 
     with pd.ExcelWriter(output, engine="openpyxl") as writer:

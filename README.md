@@ -1,7 +1,11 @@
-# StoneX Statement Trade Extractor v41
+# StoneX Statement Trade Extractor
 
-Updates in v41:
-- Realized PNL tab now includes closed-position details from Purchase & Sale GROSS PROFIT OR LOSS rows.
-- Closed-position rows include product, exchange, contract description, long/short quantities, close date, currency, and realized PNL.
-- P&S trade detail remains available for audit.
-- Open Positions keeps Contract Description; Grouped Positions remains product/risk focused.
+Version v67: OTC Trigger/Barrier, Ref Price, Original Quantity, and accumulator strike mapping.
+
+Updates in this version:
+- Trigger/Barrier now stores only the trigger/barrier price.
+- Added Ref Price from BP values.
+- Added Original Quantity from OQ values.
+- Maps OTC accumulator base level, for example `ICE Cotton 0.8456 Daily Consumer Accum...`, to `strikePrice`.
+- Adds Trigger/Barrier price to Account Grouping keys when available.
+- Keeps prior commodity, LME, FX, and grouped drill-down support.

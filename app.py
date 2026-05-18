@@ -1,5 +1,6 @@
 import streamlit as st
 import pandas as pd
+import html
 from parser import (
     extract,
     to_excel_bytes,
@@ -15,24 +16,25 @@ from parser import (
     statement_dates_by_account,
     realized_pnl_summary,
     prepare_grouped_positions_display,
+    standard_position_view_from_df,
 )
 
-st.set_page_config(page_title="StoneX Statement Trade Extractor", layout="wide")
-st.title("StoneX Statement Trade Extractor")
-st.caption("Upload one or more StoneX statement PDFs, merge trades/positions, review grouped summaries, and download Excel. Version: v67 OTC trigger/ref/original quantity mapping.")
+st.set_page_config(page_title="MyStoneX Positions", layout="wide")
+st.title("MyStoneX Positions")
+st.caption("Upload one or more StoneX statement PDFs, merge trades, review aggregated positions, drill into details, and export. Version: v76 FX additional types parser.")
 
 with st.sidebar:
     st.header("Options")
-    include_open_positions = st.checkbox("Include open positions", value=True)
+    include_trades = st.checkbox("Include trades", value=True)
     show_source_lines = st.checkbox("Show source_line columns", value=False)
     st.markdown("---")
     st.subheader("Multi-PDF merge")
-    st.caption("Open positions are always appended from all uploaded PDFs. No latest-snapshot filtering is applied.")
+    st.caption("Trades are always appended from all uploaded PDFs. No latest-snapshot filtering is applied.")
     st.markdown("---")
     st.subheader("Column display")
     st.caption("After upload, use the Customize table button above each table to show/hide columns.")
     st.markdown("---")
-    st.caption("Tip: if uploading several month-end statements, keep latest snapshot per account to avoid double-counting open positions.")
+    st.caption("Tip: use filters and aggregation views to reconcile trade-level rows back to position exposure.")
 
 uploaded_files = st.file_uploader("Upload one or more statement PDFs", type=["pdf"], accept_multiple_files=True)
 
@@ -80,7 +82,7 @@ def _has_option_positions(df):
 
     Non-option rows usually carry blank/None Call/Put and strikePrice values.
     When neither field is populated anywhere, hide those option-only columns from
-    Open Positions and Grouped Positions so futures/FX-only PDFs stay cleaner.
+    Trades and Aggregated Positions so futures/FX-only PDFs stay cleaner.
     """
     if df is None or df.empty:
         return False
@@ -113,10 +115,428 @@ def _drop_option_columns_when_no_options(df, has_options):
     """
     if df is None or has_options:
         return df
-    drop_cols = ["Call/Put"]
+    drop_cols = ["Call/Put", "NOV"]
     if "strikePrice" in df.columns and not _display_series_nonblank(df["strikePrice"]).any():
         drop_cols.append("strikePrice")
     return df.drop(columns=drop_cols, errors="ignore")
+
+
+def _numeric_series(df, cols):
+    """Return the first available numeric series from a list of candidate columns."""
+    if df is None or df.empty:
+        return pd.Series(dtype=float)
+    for col in cols:
+        if col in df.columns:
+            return pd.to_numeric(
+                df[col].astype(str).str.replace("$", "", regex=False).str.replace(",", "", regex=False).str.replace("(", "-", regex=False).str.replace(")", "", regex=False),
+                errors="coerce",
+            )
+    return pd.Series([0] * len(df), index=df.index, dtype=float)
+
+
+def _sum_numeric(df, cols):
+    series = _numeric_series(df, cols)
+    if series.empty:
+        return 0.0
+    return float(series.fillna(0).sum())
+
+
+
+
+def _option_rows_for_summary(df):
+    if df is None or df.empty:
+        return pd.Series(dtype=bool)
+    mask = pd.Series(False, index=df.index)
+    if "Type" in df.columns:
+        mask = mask | df["Type"].astype(str).str.strip().str.upper().isin(["OPTION", "NDO"])
+    if "Call/Put" in df.columns:
+        cp = df["Call/Put"].astype(str).str.strip().str.upper()
+        mask = mask | cp.isin(["CALL", "PUT", "C", "P"])
+    if "Contract Description" in df.columns:
+        mask = mask | df["Contract Description"].astype(str).str.upper().str.contains(r"\b(?:CALL|PUT|OPTION)\b", regex=True, na=False)
+    return mask.fillna(False)
+
+
+def _total_nov_for_summary(df):
+    """Sum option/NDO NOV using Market Value as the source of truth when present."""
+    if df is None or df.empty:
+        return 0.0
+    option_mask = _option_rows_for_summary(df)
+    if not option_mask.any():
+        return 0.0
+    option_rows = df.loc[option_mask]
+    mv_cols = [c for c in ["Market Value", "market_value", "MarketValue", "market_value_signed"] if c in option_rows.columns]
+    if mv_cols:
+        mv = _numeric_series(option_rows, mv_cols)
+        return float(mv.fillna(0).sum())
+    return _sum_numeric(option_rows, ["NOV"])
+
+
+
+def _total_ote_for_summary(df):
+    """Sum non-option OTE using Market Value as the source of truth when present."""
+    if df is None or df.empty:
+        return 0.0
+    option_mask = _option_rows_for_summary(df)
+    non_option = df.loc[~option_mask].copy()
+    if non_option.empty:
+        return 0.0
+    mv_cols = [c for c in ["Market Value", "market_value", "MarketValue", "market_value_signed"] if c in non_option.columns]
+    if mv_cols:
+        mv = _numeric_series(non_option, mv_cols)
+        return float(mv.fillna(0).sum())
+    return _sum_numeric(non_option, ["Unrealised PNL (OTE)"])
+
+
+def _metric_money(value):
+    try:
+        value = float(value)
+    except Exception:
+        value = 0.0
+    return f"{value:,.2f}"
+
+
+def _distinct_count(df, column):
+    if df is None or df.empty or column not in df.columns:
+        return 0
+    vals = df[column].dropna().astype(str).str.strip()
+    vals = vals[~vals.str.lower().isin(["", "none", "nan", "nat", "unknown", "multiple"])]
+    return int(vals.nunique())
+
+
+def _best_last_update(trades_df, merged_tables):
+    candidates = []
+    for df in [trades_df, merged_tables.get("Statement Dates", pd.DataFrame()) if isinstance(merged_tables, dict) else pd.DataFrame()]:
+        if df is None or df.empty:
+            continue
+        for col in ["Last Update", "last_update", "statement_date", "Statement Date", "Trade Date"]:
+            if col in df.columns:
+                parsed = pd.to_datetime(df[col], errors="coerce")
+                if parsed.notna().any():
+                    candidates.append(parsed.max())
+    if not candidates:
+        return "N/A"
+    return max(candidates).strftime("%Y-%m-%d")
+
+
+def _summary_metrics(trades_df, standard_positions_df, merged_tables):
+    """Return high-level metrics used by the Home page."""
+    non_option_positions = standard_positions_df
+    if standard_positions_df is not None and not standard_positions_df.empty and "Type" in standard_positions_df.columns:
+        non_option_positions = standard_positions_df[
+            standard_positions_df["Type"].astype(str).str.strip().str.upper() != "OPTION"
+        ]
+
+    return [
+        ("Total trades", f"{len(trades_df):,}", "Row-level trade records in the current upload."),
+        ("Total Products", f"{_distinct_count(trades_df, 'Product'):,}", "Distinct normalized products."),
+        ("Total Accounts", f"{_distinct_count(trades_df, 'Account Number'):,}", "Distinct account numbers."),
+        ("Total Unrealised PNL", _metric_money(_total_ote_for_summary(standard_positions_df)), "Non-option OTE / MTM using Market Value when available."),
+        ("Total NOV", _metric_money(_total_nov_for_summary(standard_positions_df)), "Option value from option Market Value."),
+        ("Total Market Value", _metric_money(_sum_numeric(standard_positions_df, ["Market Value", "market_value", "market_value_signed"])), "Total market value when supplied."),
+        ("Data Last Updated", _best_last_update(trades_df, merged_tables), "Latest statement/update date in the upload."),
+    ]
+
+
+def _render_metric_cards(metrics):
+    """Render large, non-truncated cards for the Home page."""
+    st.markdown(
+        """
+        <style>
+        .sx-card {
+            border: 1px solid rgba(49, 51, 63, 0.15);
+            border-radius: 14px;
+            padding: 1rem 1.1rem;
+            min-height: 118px;
+            background: rgba(248, 249, 251, 0.75);
+            box-shadow: 0 1px 2px rgba(49, 51, 63, 0.05);
+        }
+        .sx-card-label {
+            color: rgba(49, 51, 63, 0.72);
+            font-size: 0.95rem;
+            font-weight: 600;
+            margin-bottom: 0.55rem;
+        }
+        .sx-card-value {
+            color: rgb(49, 51, 63);
+            font-size: 1.85rem;
+            font-weight: 700;
+            line-height: 1.15;
+            overflow-wrap: anywhere;
+            word-break: break-word;
+        }
+        .sx-card-help {
+            color: rgba(49, 51, 63, 0.55);
+            font-size: 0.78rem;
+            margin-top: 0.45rem;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    rows = [metrics[:4], metrics[4:]]
+    for row_idx, row in enumerate(rows):
+        cols = st.columns(len(row))
+        for col, (label, value, help_text) in zip(cols, row):
+            with col:
+                st.markdown(
+                    f"""
+                    <div class="sx-card">
+                      <div class="sx-card-label">{html.escape(str(label))}</div>
+                      <div class="sx-card-value">{html.escape(str(value))}</div>
+                      <div class="sx-card-help">{html.escape(str(help_text))}</div>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+        if row_idx == 0:
+            st.write("")
+
+
+def _render_home_page(trades_df, standard_positions_df, merged_tables, extracted_tables):
+    """Render a Home page so summary values are readable and navigation is obvious."""
+    st.subheader("Home")
+    st.caption("A quick operating summary for the uploaded trade data. Values are shown in full so large numbers are not truncated.")
+    _render_metric_cards(_summary_metrics(trades_df, standard_positions_df, merged_tables))
+
+    st.markdown("---")
+    left, right = st.columns([0.55, 0.45])
+    with left:
+        st.markdown("**What you can do from here**")
+        st.markdown(
+            """
+            - **Aggregated Positions**: group trades by Product, Product + expiry/contract month, or Account.
+            - **Trades**: inspect the row-level trade records and apply filters.
+            - **Position Details / Drill-down**: review the trades behind the selected aggregated row.
+            - **Exceptions / Data Quality**: check missing fields and parser/data quality messages.
+            - **Export**: download Excel or CSV outputs.
+            """
+        )
+    with right:
+        st.markdown("**Current upload**")
+        file_count = len(extracted_tables or [])
+        exception_count = len(merged_tables.get("Exceptions", pd.DataFrame())) if isinstance(merged_tables, dict) else 0
+        st.write(f"Files loaded: **{file_count:,}**")
+        st.write(f"Exceptions / data-quality rows: **{exception_count:,}**")
+        if trades_df is not None and not trades_df.empty and "Type" in trades_df.columns:
+            type_counts = trades_df["Type"].fillna("Unknown").astype(str).replace({"": "Unknown"}).value_counts().reset_index()
+            type_counts.columns = ["Type", "Trades"]
+            st.dataframe(type_counts, use_container_width=True, hide_index=True)
+
+
+def _download_df_csv(label, df, key):
+    if df is None or df.empty:
+        return
+    st.download_button(
+        label,
+        data=df.to_csv(index=False).encode("utf-8-sig"),
+        file_name=f"{_safe_key(label).lower()}.csv",
+        mime="text/csv",
+        key=key,
+    )
+
+
+def _date_candidates(df):
+    if df is None or df.empty:
+        return []
+    preferred = ["expiryDate", "Trade Date", "Last Update", "statement_date", "Statement Date"]
+    return [c for c in preferred if c in df.columns]
+
+
+def _date_bounds(df, column):
+    if df is None or df.empty or column not in df.columns:
+        return None, None
+    parsed = pd.to_datetime(df[column], errors="coerce")
+    if not parsed.notna().any():
+        return None, None
+    return parsed.min().date(), parsed.max().date()
+
+
+def _data_quality_summary(df):
+    checks = []
+    if df is None or df.empty:
+        return pd.DataFrame(columns=["Check", "Issue Count", "Description"])
+    required_checks = [
+        ("Missing Account Number", "Account Number", "Rows where account number is blank."),
+        ("Missing Product", "Product", "Rows where normalized product is blank."),
+        ("Missing Type", "Type", "Rows where trade type is blank."),
+        ("Missing Quantity", "Quantity", "Rows where trade quantity is blank or not numeric."),
+        ("Missing Currency", "Currency", "Rows where currency is blank."),
+        ("Missing expiryDate", "expiryDate", "Rows where expiry/value/end date is blank."),
+    ]
+    for name, col, desc in required_checks:
+        if col not in df.columns:
+            checks.append({"Check": name, "Issue Count": "N/A", "Description": f"Column {col} is not available in this dataset."})
+            continue
+        if col == "Quantity":
+            count = int(pd.to_numeric(df[col], errors="coerce").isna().sum())
+        else:
+            count = int((~_display_series_nonblank(df[col])).sum())
+        checks.append({"Check": name, "Issue Count": count, "Description": desc})
+    return pd.DataFrame(checks)
+
+
+def _clean_filter_values(series):
+    if series is None:
+        return []
+    vals = []
+    for v in series.dropna().astype(str).str.strip().tolist():
+        if v and v.lower() not in {"none", "nan", "nat", "unknown", "other", "multiple"}:
+            vals.append(v)
+    return sorted(set(vals), key=lambda x: x.upper())
+
+
+def _render_position_search_controls(base_view_df, key_prefix):
+    """Render account/product/type/exchange/currency/date filters for Trades and Aggregated Positions."""
+    filters = {
+        "account": "",
+        "product": "",
+        "types": [],
+        "exchanges": [],
+        "currencies": [],
+        "date_enabled": False,
+        "date_field": None,
+        "date_from": None,
+        "date_to": None,
+    }
+    if base_view_df is None or base_view_df.empty:
+        return filters
+
+    key_prefix_safe = _safe_key(key_prefix)
+    with st.container(border=True):
+        st.caption("Filters")
+        r1c1, r1c2, r1c3 = st.columns(3)
+        filters["account"] = r1c1.text_input(
+            "Account Number contains",
+            value="",
+            key=f"{key_prefix_safe}_account_search_v76",
+            placeholder="e.g. LME11630",
+        )
+        filters["product"] = r1c2.text_input(
+            "Product contains",
+            value="",
+            key=f"{key_prefix_safe}_product_search_v76",
+            placeholder="e.g. Coffee, Copper, AUD/USD",
+        )
+        type_options = _clean_filter_values(base_view_df["Type"]) if "Type" in base_view_df.columns else []
+        filters["types"] = r1c3.multiselect(
+            "Type",
+            options=type_options,
+            key=f"{key_prefix_safe}_type_filter_v76",
+        ) if type_options else []
+
+        r2c1, r2c2, r2c3 = st.columns(3)
+        exchange_options = _clean_filter_values(base_view_df["Exchange"]) if "Exchange" in base_view_df.columns else []
+        filters["exchanges"] = r2c1.multiselect(
+            "Exchange",
+            options=exchange_options,
+            key=f"{key_prefix_safe}_exchange_filter_v76",
+        ) if exchange_options else []
+
+        currency_values = []
+        for ccy_col in ["Currency", "CCY 1", "CCY 2"]:
+            if ccy_col in base_view_df.columns:
+                currency_values.extend(_clean_filter_values(base_view_df[ccy_col]))
+        currency_options = sorted(set(currency_values), key=lambda x: x.upper())
+        filters["currencies"] = r2c2.multiselect(
+            "Currency",
+            options=currency_options,
+            key=f"{key_prefix_safe}_currency_filter_v76",
+        ) if currency_options else []
+
+        date_fields = _date_candidates(base_view_df)
+        if date_fields:
+            filters["date_enabled"] = r2c3.checkbox("Filter by date range", key=f"{key_prefix_safe}_date_enabled_v76")
+            if filters["date_enabled"]:
+                filters["date_field"] = r2c3.selectbox("Date field", date_fields, key=f"{key_prefix_safe}_date_field_v76")
+                min_date, max_date = _date_bounds(base_view_df, filters["date_field"])
+                if min_date and max_date:
+                    d1, d2 = r2c3.columns(2)
+                    filters["date_from"] = d1.date_input("From", value=min_date, key=f"{key_prefix_safe}_date_from_v76")
+                    filters["date_to"] = d2.date_input("To", value=max_date, key=f"{key_prefix_safe}_date_to_v76")
+        else:
+            r2c3.caption("Date range unavailable")
+    return filters
+
+def _position_filter_mask(view_df, filters):
+    if view_df is None or view_df.empty:
+        return pd.Series(dtype=bool)
+    mask = pd.Series(True, index=view_df.index)
+
+    account_q = str(filters.get("account") or "").strip()
+    if account_q and "Account Number" in view_df.columns:
+        mask &= view_df["Account Number"].astype(str).str.contains(account_q, case=False, na=False, regex=False)
+
+    product_q = str(filters.get("product") or "").strip()
+    if product_q and "Product" in view_df.columns:
+        mask &= view_df["Product"].astype(str).str.contains(product_q, case=False, na=False, regex=False)
+
+    selected_types = filters.get("types") or []
+    if selected_types and "Type" in view_df.columns:
+        wanted = {str(x).strip().upper() for x in selected_types}
+        mask &= view_df["Type"].astype(str).str.strip().str.upper().isin(wanted)
+
+    selected_exchanges = filters.get("exchanges") or []
+    if selected_exchanges and "Exchange" in view_df.columns:
+        wanted = {str(x).strip().upper() for x in selected_exchanges}
+        mask &= view_df["Exchange"].astype(str).str.strip().str.upper().isin(wanted)
+
+    selected_currencies = filters.get("currencies") or []
+    if selected_currencies:
+        wanted = {str(x).strip().upper() for x in selected_currencies}
+        ccy_mask = pd.Series(False, index=view_df.index)
+        for ccy_col in ["Currency", "CCY 1", "CCY 2"]:
+            if ccy_col in view_df.columns:
+                ccy_mask |= view_df[ccy_col].astype(str).str.strip().str.upper().isin(wanted)
+        mask &= ccy_mask
+
+    if filters.get("date_enabled") and filters.get("date_field") in view_df.columns:
+        date_field = filters.get("date_field")
+        parsed = pd.to_datetime(view_df[date_field], errors="coerce")
+        if filters.get("date_from") is not None:
+            mask &= parsed >= pd.to_datetime(filters.get("date_from"))
+        if filters.get("date_to") is not None:
+            mask &= parsed <= pd.to_datetime(filters.get("date_to"))
+
+    return mask.fillna(False)
+
+def _apply_position_filters_to_view(view_df, filters):
+    if view_df is None or view_df.empty:
+        return view_df
+    mask = _position_filter_mask(view_df, filters)
+    if mask.empty:
+        return view_df.iloc[0:0]
+    return view_df.loc[mask].copy()
+
+
+def _apply_position_filters_to_tables(tables, filters):
+    """Filter raw Trades before grouping so hidden Account Number still works."""
+    raw = tables.get("Open Positions", pd.DataFrame())
+    if raw is None or raw.empty:
+        return tables
+    has_filter = bool(
+        str(filters.get("account") or "").strip()
+        or str(filters.get("product") or "").strip()
+        or filters.get("types")
+        or filters.get("exchanges")
+        or filters.get("currencies")
+        or filters.get("date_enabled")
+    )
+    if not has_filter:
+        return tables
+
+    base_view = open_positions_standard_view({"Open Positions": raw})
+    mask = _position_filter_mask(base_view, filters)
+    filtered = raw.iloc[0:0].copy()
+    if len(mask) == len(raw):
+        filtered = raw.loc[mask.to_numpy()].copy()
+    else:
+        # Defensive fallback if indexes were transformed unexpectedly.
+        filtered = raw.iloc[list(mask[mask].index)].copy()
+    out = dict(tables)
+    out["Open Positions"] = filtered
+    return out
 
 def _safe_key(text):
     return "".join(ch if ch.isalnum() else "_" for ch in str(text))
@@ -186,7 +606,7 @@ def display_custom_table(label, df, default_columns=None, default_only=False, se
     display_df = df[selected]
 
     if selectable:
-        # Streamlit dataframe row selection powers the grouped-position drill-down.
+        # Streamlit dataframe row selection powers the aggregated-position drill-down.
         # Selection row indexes refer to the displayed dataframe, which is built from df
         # without reordering, so they can be used to fetch the selected source row.
         return st.dataframe(
@@ -216,6 +636,80 @@ def display_custom_table(label, df, default_columns=None, default_only=False, se
         st.dataframe(display_df, use_container_width=True)
     return None
 
+
+
+
+def _nonblank_filter_options(df, column):
+    if df is None or df.empty or column not in df.columns:
+        return []
+    vals = []
+    for value in df[column].dropna().tolist():
+        text = str(value).strip()
+        if text and text.lower() not in {"none", "nan", "nat", "unknown", "other", "multiple"}:
+            vals.append(text)
+    return sorted(set(vals), key=lambda x: x.upper())
+
+
+def _position_search_mask(df, label, key_prefix):
+    """Search/filter Trades or grouped source rows by account, Type, Exchange."""
+    if df is None or df.empty:
+        return pd.Series(dtype=bool)
+
+    mask = pd.Series(True, index=df.index)
+    key_prefix = _safe_key(key_prefix)
+
+    with st.expander(f"Search / filter {label}", expanded=False):
+        c1, c2, c3 = st.columns(3)
+        account_value = ""
+        selected_types = []
+        selected_exchanges = []
+
+        with c1:
+            if "Account Number" in df.columns:
+                account_value = st.text_input("Account Number contains", key=f"{key_prefix}_account_search")
+            else:
+                st.caption("Account Number not available in this view")
+        with c2:
+            type_options = _nonblank_filter_options(df, "Type")
+            if type_options:
+                selected_types = st.multiselect("Type", type_options, key=f"{key_prefix}_type_filter")
+            else:
+                st.caption("Type not available")
+        with c3:
+            exchange_options = _nonblank_filter_options(df, "Exchange")
+            if exchange_options:
+                selected_exchanges = st.multiselect("Exchange", exchange_options, key=f"{key_prefix}_exchange_filter")
+            else:
+                st.caption("Exchange not available")
+
+        if account_value and "Account Number" in df.columns:
+            mask = mask & df["Account Number"].astype(str).str.contains(account_value, case=False, na=False)
+        if selected_types and "Type" in df.columns:
+            mask = mask & df["Type"].astype(str).isin(selected_types)
+        if selected_exchanges and "Exchange" in df.columns:
+            mask = mask & df["Exchange"].astype(str).isin(selected_exchanges)
+
+        filtered_count = int(mask.sum()) if len(mask) else 0
+        st.caption(f"Matched {filtered_count:,} of {len(df):,} rows.")
+
+    return mask
+
+
+def _filtered_tables_by_open_positions_mask(tables, display_df, mask):
+    """Return a copy of merged tables with Trades filtered by a display-view mask."""
+    if tables is None:
+        return tables
+    if mask is None or len(mask) == 0:
+        return tables
+    raw = tables.get("Open Positions", pd.DataFrame())
+    if raw is None or raw.empty:
+        return tables
+    if len(raw) != len(mask):
+        # If row counts ever diverge, avoid applying a wrong mask.
+        return tables
+    out = dict(tables)
+    out["Open Positions"] = raw.loc[list(mask.to_numpy())].reset_index(drop=True)
+    return out
 
 def _event_selected_rows(event):
     """Return selected row indexes from Streamlit's dataframe selection event."""
@@ -267,8 +761,8 @@ def _apply_numeric_or_text_filter(mask, df, column, value):
 
 
 def _apply_fx_drilldown_filters(mask, df, row):
-    """When an FX grouped row is selected, keep drill-down aligned to FX keys."""
-    # FX grouped rows may contain aggregated currency amounts and/or hidden trade prices.
+    """When an FX aggregated row is selected, keep drill-down aligned to FX keys."""
+    # FX aggregated rows may contain aggregated currency amounts and/or hidden trade prices.
     # Drill-down should therefore filter by stable identity fields only: product, currencies,
     # and value/settlement date when that date is present in the selected group.
     for col in ["CCY 1", "CCY 2"]:
@@ -281,14 +775,14 @@ def _apply_fx_drilldown_filters(mask, df, row):
 
 
 def _apply_contract_or_expiry_drill_filter(mask, df, row):
-    """Filter by expiryDate when the grouped row has one; otherwise by Contract Month/Year."""
+    """Filter by expiryDate when the aggregated row has one; otherwise by Contract Month/Year."""
     expiry = row.get("expiryDate") if hasattr(row, "get") else None
     if not _is_blank_drill_value(expiry) and "expiryDate" in df.columns:
         return _apply_text_filter(mask, df, "expiryDate", expiry)
     return _apply_text_filter(mask, df, "Contract Month/Year", row.get("Contract Month/Year"))
 
 def _open_positions_for_group(open_df, selected_group_row, selected_preset):
-    """Filter open-position rows to the rows that make up a selected grouped row."""
+    """Filter trade rows to the rows that make up a selected aggregated row."""
     if open_df is None or open_df.empty or selected_group_row is None:
         return pd.DataFrame()
 
@@ -331,7 +825,7 @@ def _open_positions_for_group(open_df, selected_group_row, selected_preset):
             mask = _apply_text_filter(mask, df, "Call/Put", call_put)
             mask = _apply_numeric_or_text_filter(mask, df, "strikePrice", strike)
         else:
-            # This selected grouped row is the futures/non-option bucket for the product+month.
+            # This selected aggregated row is the futures/non-option bucket for the product+month.
             # Keep option rows with the same product/month out of the futures drill-down.
             if "Call/Put" in df.columns:
                 mask = mask & _blank_series_mask(df["Call/Put"])
@@ -345,17 +839,17 @@ def _selected_group_description(selected_group_row, selected_preset):
     if selected_group_row is None:
         return ""
     parts = []
-    for col in ["Account Number", "Product", "Contract Month/Year", "expiryDate", "Trigger/Barrier", "CCY 1", "CCY 2", "Call/Put", "strikePrice"]:
+    for col in ["Account Number", "Product", "Type", "Contract Month/Year", "expiryDate", "Trigger/Barrier", "CCY 1", "CCY 2", "Call/Put", "strikePrice"]:
         if col in selected_group_row.index and not _is_blank_drill_value(selected_group_row.get(col)):
             parts.append(f"{col}: {selected_group_row.get(col)}")
     return f"{selected_preset} — " + ", ".join(parts) if parts else selected_preset
 
 def _drilldown_signature(selected_group_row, selected_preset):
-    """Stable identifier for the selected grouped-position row."""
+    """Stable identifier for the selected aggregated-position row."""
     if selected_group_row is None:
         return None
     pieces = [str(selected_preset)]
-    for col in ["Account Number", "Product", "Contract Month/Year", "expiryDate", "Trigger/Barrier", "CCY 1", "CCY 2", "Call/Put", "strikePrice"]:
+    for col in ["Account Number", "Product", "Type", "Contract Month/Year", "expiryDate", "Trigger/Barrier", "CCY 1", "CCY 2", "Call/Put", "strikePrice"]:
         value = selected_group_row.get(col) if hasattr(selected_group_row, "get") else None
         pieces.append(f"{col}={'' if _is_blank_drill_value(value) else str(value).strip()}")
     return "|".join(pieces)
@@ -372,7 +866,7 @@ def _close_drilldown(sig=None):
 
 
 def _render_drilldown_content(drill_df, selected_group_row, selected_preset, sig):
-    """Render the open-position drill-down contents inside a dialog or fallback panel."""
+    """Render the trade drill-down contents inside a dialog or fallback panel."""
     header_cols = st.columns([0.78, 0.22])
     with header_cols[0]:
         st.caption(_selected_group_description(selected_group_row, selected_preset))
@@ -382,17 +876,17 @@ def _render_drilldown_content(drill_df, selected_group_row, selected_preset, sig
             st.rerun()
 
     if drill_df.empty:
-        st.warning("No matching open-position rows were found for the selected group. This usually means one of the grouping fields is blank or formatted differently in the raw rows.")
+        st.warning("No matching trade rows were found for the selected group. This usually means one of the grouping fields is blank or formatted differently in the raw rows.")
         return
 
     total_qty = pd.to_numeric(drill_df.get("Quantity"), errors="coerce").sum() if "Quantity" in drill_df.columns else None
     metric_cols = st.columns(2)
-    metric_cols[0].metric("Matched open-position rows", f"{len(drill_df):,}")
+    metric_cols[0].metric("Matched trade rows", f"{len(drill_df):,}")
     if total_qty is not None:
         metric_cols[1].metric("Matched quantity", f"{total_qty:,.0f}")
 
     display_custom_table(
-        "Selected Group Open Positions",
+        "Selected Group Trades",
         drill_df,
         default_columns=OPEN_POSITION_COLUMNS,
         default_only=False,
@@ -401,7 +895,7 @@ def _render_drilldown_content(drill_df, selected_group_row, selected_preset, sig
 
 def _show_drilldown_widget(drill_df, selected_group_row, selected_preset, sig):
     """Show drill-down as a separate closable widget. Uses st.dialog when available."""
-    title = "Open Positions making up selected group"
+    title = "Trades making up selected group"
     if hasattr(st, "dialog"):
         try:
             dialog_decorator = st.dialog(title, width="large")
@@ -426,7 +920,7 @@ if uploaded_files:
     for idx, uploaded in enumerate(uploaded_files, start=1):
         pdf_bytes = uploaded.read()
         with st.spinner(f"Extracting {uploaded.name}..."):
-            tables = extract(pdf_bytes, include_open_positions=include_open_positions)
+            tables = extract(pdf_bytes, include_open_positions=include_trades)
             tables = add_source_pdf(tables, uploaded.name, idx)
             extracted_tables.append(tables)
 
@@ -435,102 +929,90 @@ if uploaded_files:
     open_positions_base_view_df = open_positions_standard_view(merged_tables)
     has_option_positions = _has_option_positions(open_positions_base_view_df)
 
-    st.subheader("Merged output")
-    counts = {name: len(df) for name, df in merged_tables.items() if name not in ["Summary"]}
-    c1, c2, c3, c4, c5 = st.columns(5)
-    c1.metric("PDFs", len(uploaded_files))
-    c2.metric("Executed trades", counts.get("Executed Trades", 0))
-    c3.metric("P&S rows", counts.get("Purchase & Sale", 0))
-    c4.metric("Open positions", counts.get("Open Positions", 0))
-    c5.metric("Exceptions", counts.get("Exceptions", 0))
+    standard_positions_summary_df = standard_position_view_from_df(merged_tables.get("Open Positions", pd.DataFrame()))
 
-    st.download_button(
-        "Download merged Excel",
-        data=merged_excel,
-        file_name="stonex_merged_positions_trades.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        key="download_merged",
-    )
+    latest_aggregated_df = pd.DataFrame()
+    latest_trades_df = pd.DataFrame()
+    latest_drill_df = pd.DataFrame()
 
     tabs = st.tabs([
-        "Grouped Positions",
-        "Realized PNL",
-        "Statement Dates",
-        "Executed Trades",
-        "Open Positions",
-        "All Sheets",
-        "Per-PDF Audit",
+        "Home",
+        "Aggregated Positions",
+        "Trades",
+        "Position Details / Drill-down",
+        "Exceptions / Data Quality",
+        "Export",
     ])
 
     with tabs[0]:
-        st.caption("Choose a position view. The selected view controls how raw open-position rows are aggregated.")
+        _render_home_page(open_positions_base_view_df, standard_positions_summary_df, merged_tables, extracted_tables)
+
+    with tabs[1]:
+        st.caption("Choose an aggregation view. Filters apply before aggregation, so account/type/exchange/currency/date filters work even when those columns are hidden in the selected view.")
         grouping_presets = {
             "Product": {
-                "description": "One row per product across all accounts and contract months.",
+                "description": "One row per product across all accounts, contract months, expiry dates, strikes, and trade prices.",
                 "mode": "custom",
                 "group_cols": ["product"],
             },
             "Product + Contract Month/Year": {
-                "description": "Automatic risk view: rows group by product + contract month/year, but use expiryDate/value date instead of month when expiryDate is available; OTC/swap rows keep Trigger/Barrier when available; options also keep Call/Put + Strike Price.",
+                "description": "Risk view by product and expiry/value/end date when available, otherwise contract month/year. OTC rows keep Trigger/Barrier when available; options also keep Call/Put + Strike Price.",
                 "mode": "auto_futures_options",
                 "group_cols": None,
             },
             "Account Grouping": {
-                "description": "Account risk view: account + product + contract month/year, using expiryDate/value date when available; Trigger/Barrier price when available; options additionally keep Call/Put + Strike Price.",
+                "description": "Ownership view by account + product and expiry/value/end date when available, otherwise contract month/year. OTC rows keep Trigger/Barrier; options also keep Call/Put + Strike Price.",
                 "mode": "custom",
                 "group_cols": ["account_number", "product", "ref_month", "trigger_barrier", "option_type", "strike"],
             },
         }
+        grouped_filters = _render_position_search_controls(open_positions_base_view_df, "aggregated_positions")
+        st.session_state["last_aggregated_filters"] = grouped_filters
+        grouped_source_tables = _apply_position_filters_to_tables(merged_tables, grouped_filters)
+        grouped_open_base_view_df = open_positions_standard_view(grouped_source_tables)
+        grouped_has_option_positions = _has_option_positions(grouped_open_base_view_df)
+
         selected_preset = st.radio(
-            "Grouped Positions view",
+            "Aggregated Positions view",
             options=list(grouping_presets.keys()),
             horizontal=True,
-            key="grouped_positions_preset_view",
+            key="aggregated_positions_preset_view_v76",
         )
         preset = grouping_presets[selected_preset]
         if preset["mode"] == "auto_futures_options":
-            grouped_pos_df = grouped_positions_product_month_auto_standard_view(merged_tables)
-            st.write("Grouping by:", "Product + Contract Month/Year; expiryDate/value date when available; Trigger/Barrier when available; options additionally by Call/Put + Strike Price")
+            grouped_pos_df = grouped_positions_product_month_auto_standard_view(grouped_source_tables)
+            st.write("Grouping by:", "Product + expiryDate/value date when available, otherwise Contract Month/Year; Trigger/Barrier when available; options additionally by Call/Put + Strike Price")
         else:
-            grouped_pos_df = grouped_positions_standard_view(merged_tables, preset["group_cols"])
+            grouped_pos_df = grouped_positions_standard_view(grouped_source_tables, preset["group_cols"])
             st.write("Grouping by:", selected_preset)
-        st.caption(preset["description"] + " Avg Fill Price is weighted by absolute Net Quantity and rounded to 2 decimals. NOV carries option OTE; option rows leave OTE blank. Trade Price remains available in Open Positions, not grouped views.")
+        st.caption(preset["description"] + " NOV carries option OTE; option rows leave OTE blank. Trade Price, Ref Price, and Original Quantity remain available in Trades, not Aggregated Positions.")
 
-        # Grouped Positions should stay risk-focused. Contract Description is intentionally
-        # hidden here; use Open Positions for the exact PDF contract description.
         grouped_pos_df = grouped_pos_df.drop(columns=["Contract Description", "Full Name"], errors="ignore")
-        # Finalize grouped layout:
-        # - Product grouping hides Call/Put and strikePrice.
-        # - NOV receives option OTE; OTE is reserved for futures/forwards.
-        # - Realised PNL and Day PNL are present on every grouping view.
         grouped_pos_df = prepare_grouped_positions_display(
             grouped_pos_df,
-            tables=merged_tables,
+            tables=grouped_source_tables,
             selected_preset=selected_preset,
             drop_option_columns=(selected_preset == "Product"),
         )
-        grouped_pos_df = _drop_option_columns_when_no_options(grouped_pos_df, has_option_positions)
-        if not has_option_positions:
-            st.caption("No option rows detected in the uploaded PDF(s), so Call/Put and strikePrice are hidden from position views.")
-        # Only Account Grouping should display Account Number. Product-level risk views
-        # intentionally aggregate across accounts, so hide Account Number there.
+        grouped_pos_df = _drop_option_columns_when_no_options(grouped_pos_df, grouped_has_option_positions)
+        if not grouped_has_option_positions:
+            st.caption("No option rows detected, so Call/Put and strikePrice are hidden from position views.")
         if selected_preset in {"Product", "Product + Contract Month/Year"}:
             grouped_pos_df = grouped_pos_df.drop(columns=["Account Number"], errors="ignore")
         grouped_default_columns = [c for c in GROUPED_POSITION_COLUMNS if c in grouped_pos_df.columns]
 
-        st.caption("Click a row in the Grouped Positions table to view the Open Positions rows that make up that group.")
+        st.caption("Click a row in the Aggregated Positions table to view the trade rows that make up that group.")
         group_selection = display_custom_table(
-            f"Grouped Positions - {selected_preset}",
+            f"Aggregated Positions - {selected_preset}",
             grouped_pos_df,
             default_columns=grouped_default_columns,
             default_only=True,
             selectable=True,
-            selection_key=f"grouped_positions_row_selection_{_safe_key(selected_preset)}_v67",
-            # Keep separate column-toggle state per grouping preset. Without this,
-            # hiding Call/Put and strikePrice in the Product preset can make those
-            # columns appear hidden when the user switches to Account Grouping.
-            table_key_override=f"Grouped Positions {selected_preset} v67",
+            selection_key=f"aggregated_positions_row_selection_{_safe_key(selected_preset)}_v76",
+            table_key_override=f"Aggregated Positions {selected_preset} v76",
         )
+        latest_aggregated_df = grouped_pos_df.copy()
+        _download_df_csv("Download aggregated positions CSV", grouped_pos_df, f"download_aggregated_positions_{_safe_key(selected_preset)}_v76")
 
         selected_rows = _event_selected_rows(group_selection)
         selected_group = None
@@ -552,65 +1034,119 @@ if uploaded_files:
                         st.session_state["drilldown_signature"] = selected_sig
                         st.rerun()
         else:
-            st.info("Select a grouped-position row to open a closable drill-down widget with the underlying Open Positions.")
+            st.info("Select an aggregated-position row to open a closeable drill-down widget with the underlying trades.")
 
         if st.session_state.get("drilldown_row") and st.session_state.get("drilldown_preset"):
             selected_group = pd.Series(st.session_state["drilldown_row"])
             selected_preset_for_drill = st.session_state["drilldown_preset"]
             drill_sig = st.session_state.get("drilldown_signature") or _drilldown_signature(selected_group, selected_preset_for_drill)
-            open_df_for_drill = open_positions_base_view_df
+            open_df_for_drill = grouped_open_base_view_df
             drill_df = _open_positions_for_group(open_df_for_drill, selected_group, selected_preset_for_drill)
-            drill_df = _drop_option_columns_when_no_options(drill_df, has_option_positions)
+            drill_df = _drop_option_columns_when_no_options(drill_df, grouped_has_option_positions)
+            latest_drill_df = drill_df.copy()
             _show_drilldown_widget(drill_df, selected_group, selected_preset_for_drill, drill_sig)
-    with tabs[1]:
-        st.caption("Realized PNL includes statement summary, closed-position GROSS PROFIT OR LOSS rows, and P&S trade audit detail when available.")
-        pnl_df = realized_pnl_summary(merged_tables)
-        if not pnl_df.empty and "realized_pnl" in pnl_df.columns:
-            metric_df = pnl_df[pnl_df.get("pnl_view", "") == "Summary"] if "pnl_view" in pnl_df.columns else pnl_df
-            st.metric("MTD realized PNL", f"{pd.to_numeric(metric_df['realized_pnl'], errors='coerce').sum():,.2f}")
-        display_custom_table(
-            "Realized PNL",
-            pnl_df,
-            default_columns=["pnl_view", "statement_date", "account_number", "currency", "realized_pnl", "mtd_realized_pnl", "ytd_realized_pnl", "close_date", "product", "exchange", "ref_month", "contract_description", "long", "short", "quantity", "price", "close_price", "trade_id", "source_sheet"],
-            default_only=False,
-        )
+
     with tabs[2]:
-        st.caption("Use this sheet to confirm which statement date was used for each account/source file.")
-        display_custom_table("Statement Dates", statement_dates_by_account(merged_tables))
-    with tabs[3]:
-        display_custom_table("Executed Trades", merged_tables.get("Executed Trades", pd.DataFrame()))
-    with tabs[4]:
-        open_positions_view_df = _drop_option_columns_when_no_options(open_positions_base_view_df, has_option_positions)
+        st.caption("Trades are the row-level open trade records that make up aggregated exposure.")
+        trades_filters = _render_position_search_controls(open_positions_base_view_df, "trades")
+        trades_filtered_df = _apply_position_filters_to_view(open_positions_base_view_df, trades_filters)
+        trades_has_option_positions = _has_option_positions(trades_filtered_df)
+        trades_view_df = _drop_option_columns_when_no_options(trades_filtered_df, trades_has_option_positions)
+        latest_trades_df = trades_view_df.copy()
         display_custom_table(
-            "Open Positions",
-            open_positions_view_df,
-            default_columns=_open_positions_default_columns(open_positions_view_df),
+            "Trades",
+            trades_view_df,
+            default_columns=_open_positions_default_columns(trades_view_df),
             default_only=True,
-            table_key_override="Open Positions v67 otc fields",
+            table_key_override="Trades v76",
         )
+        _download_df_csv("Download trades CSV", trades_view_df, "download_trades_csv_v76")
+
+    with tabs[3]:
+        st.caption("This section shows the trade-level rows behind the last selected Aggregated Positions row.")
+        if st.session_state.get("drilldown_row") and st.session_state.get("drilldown_preset"):
+            selected_group = pd.Series(st.session_state["drilldown_row"])
+            selected_preset_for_drill = st.session_state["drilldown_preset"]
+            filters_for_drill = st.session_state.get("last_aggregated_filters", {})
+            drill_source = _apply_position_filters_to_view(open_positions_base_view_df, filters_for_drill)
+            drill_df = _open_positions_for_group(drill_source, selected_group, selected_preset_for_drill)
+            drill_df = _drop_option_columns_when_no_options(drill_df, _has_option_positions(drill_source))
+            latest_drill_df = drill_df.copy()
+            st.subheader("Selected group")
+            st.caption(_selected_group_description(selected_group, selected_preset_for_drill))
+            display_custom_table(
+                "Position Details / Drill-down",
+                drill_df,
+                default_columns=_open_positions_default_columns(drill_df),
+                default_only=False,
+                table_key_override="Position Details Drilldown v76",
+            )
+            _download_df_csv("Download drill-down trades CSV", drill_df, "download_drilldown_csv_v76")
+            if st.button("Clear selected group", key="clear_drilldown_tab_v76"):
+                _close_drilldown()
+                st.rerun()
+        else:
+            st.info("Select a row in Aggregated Positions to see the underlying trades here.")
+
+    with tabs[4]:
+        st.caption("Review parser/data-quality issues and completeness checks.")
+        exceptions_df = merged_tables.get("Exceptions", pd.DataFrame())
+        q1, q2, q3 = st.columns(3)
+        q1.metric("Exceptions", f"{len(exceptions_df):,}")
+        quality_df = _data_quality_summary(open_positions_base_view_df)
+        numeric_issue_counts = pd.to_numeric(quality_df.get("Issue Count", pd.Series(dtype=float)), errors="coerce")
+        q2.metric("Data quality issues", f"{int(numeric_issue_counts.fillna(0).sum()):,}")
+        q3.metric("Filtered trade rows", f"{len(open_positions_base_view_df):,}")
+        with st.expander("Data Quality Checks", expanded=True):
+            display_custom_table("Data Quality Checks", quality_df, default_only=False)
+        with st.expander(f"Exceptions ({len(exceptions_df):,} rows)", expanded=not exceptions_df.empty):
+            display_custom_table("Exceptions / Data Quality", exceptions_df, default_only=False)
+            _download_df_csv("Download exceptions CSV", exceptions_df, "download_exceptions_csv_v76")
+
     with tabs[5]:
-        for name, df in merged_tables.items():
-            with st.expander(f"{name} ({len(df)} rows)"):
-                display_custom_table(f"All Sheets {name}", df)
-    with tabs[6]:
-        for idx, (uploaded, tables) in enumerate(zip(uploaded_files, extracted_tables), start=1):
-            with st.expander(f"{idx}. {uploaded.name}"):
-                p_counts = {name: len(df) for name, df in tables.items() if name != "Summary"}
-                st.write(p_counts)
+        st.caption("Download full or view-specific outputs.")
+        st.download_button(
+            "Download merged Excel",
+            data=merged_excel,
+            file_name="stonex_merged_trades_positions.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key="download_merged_v76",
+        )
+        st.markdown("**View exports**")
+        export_cols = st.columns(3)
+        with export_cols[0]:
+            _download_df_csv("Download all trades CSV", open_positions_base_view_df, "download_all_trades_csv_v76")
+        with export_cols[1]:
+            if 'latest_aggregated_df' in locals() and not latest_aggregated_df.empty:
+                _download_df_csv("Download current aggregated CSV", latest_aggregated_df, "download_current_aggregated_csv_v76")
+        with export_cols[2]:
+            if 'latest_drill_df' in locals() and not latest_drill_df.empty:
+                _download_df_csv("Download current drill-down CSV", latest_drill_df, "download_current_drilldown_csv_v76")
+
+        with st.expander("Per-file exports"):
+            for idx, (uploaded, tables) in enumerate(zip(uploaded_files, extracted_tables), start=1):
                 st.download_button(
                     f"Download Excel for {uploaded.name}",
                     data=to_excel_bytes(tables),
                     file_name=uploaded.name.rsplit(".", 1)[0] + "_trades.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    key=f"download_{idx}_{uploaded.name}",
+                    key=f"download_{idx}_{uploaded.name}_v76",
                 )
+
+
 else:
+    st.subheader("Home")
     st.info("Upload one or more PDFs to begin.")
     st.markdown(
         """
-        **Multi-PDF behavior:**
-        - Trades are appended and de-duplicated when possible.
-        - Open positions are always appended from all uploaded PDFs.
-        - No latest-snapshot filtering is applied.
+        This prototype is organized around five working sections after upload:
+
+        - **Aggregated Positions** for exposure-level views.
+        - **Trades** for row-level trade records.
+        - **Position Details / Drill-down** for the trades behind a selected aggregate.
+        - **Exceptions / Data Quality** for completeness checks.
+        - **Export** for Excel and CSV outputs.
+
+        **Multi-PDF behavior:** trades are appended and de-duplicated when possible. No latest-snapshot filtering is applied.
         """
     )

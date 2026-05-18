@@ -782,6 +782,199 @@ def _section_limits(rows, names):
     return out
 
 
+
+def _is_pct_line(s: str | None) -> bool:
+    return bool(re.match(r"^[-+]?\d+(?:\.\d+)?%$", str(s or "").strip()))
+
+
+def _pct_to_num(s: str | None) -> float | None:
+    if s is None:
+        return None
+    return _num_any(str(s).strip().replace("%", ""))
+
+
+def _parse_monthly_fx_option_ndo_lines(text: str, stmt_date: str | None, account: str | None, page_no: int) -> list[dict]:
+    """Parse Markets LLC FX Option Open Positions - Non Deliverables.
+
+    Example layout:
+      Trade Date, Trade Id, Type=NDO, Curr Pair, Buy/Sell, Put/Call,
+      CCY1, CCY1 Buy/(Sell), CCY2, CCY2 Buy/(Sell), Strike Price,
+      Barrier, Expiry Date, Value Date, Prem VD, % Premium, Market Price, Market Value.
+
+    PyMuPDF emits each cell on a separate line and omits blank Barrier/Prem VD
+    cells, so the parser consumes optional Barrier and Prem VD only when present.
+    """
+    rows: list[dict] = []
+    lines = [" ".join(x.strip().split()) for x in text.splitlines() if x.strip()]
+    if "FX Option Open Positions" not in text:
+        # Continuation pages often repeat only the column header. Do not confuse
+        # this with FX Spot/Forward; NDO option pages have Put/Call and Strike Price.
+        if not ("Put/Call" in lines and "Strike Price" in lines and "NDO" in lines):
+            return rows
+    try:
+        start = next(i for i, line in enumerate(lines) if "FX Option Open Positions" in line)
+    except StopIteration:
+        try:
+            start = next(i for i, line in enumerate(lines) if line == "Trade Date")
+        except StopIteration:
+            return rows
+
+    # Stop before page footer/account summary if present.
+    stop = len(lines)
+    for j in range(start + 1, len(lines)):
+        if lines[j].startswith("Account Information") or lines[j].startswith("Disclaimers") or lines[j].startswith("Page "):
+            stop = j
+            break
+
+    def is_next_row(idx: int) -> bool:
+        return idx < stop and _is_dd_mmm_yyyy(lines[idx])
+
+    i = start + 1
+    while i < stop:
+        line = lines[i]
+        if not _is_dd_mmm_yyyy(line):
+            i += 1
+            continue
+        try:
+            if i + 12 >= stop:
+                break
+            trade_date = lines[i]
+            trade_id = lines[i + 1].strip()
+            trade_type = lines[i + 2].strip().upper()
+            curr_pair = lines[i + 3].strip().upper()
+            buy_sell = lines[i + 4].strip().title()
+            put_call_raw = lines[i + 5].strip()
+            ccy1 = lines[i + 6].strip().upper()
+            ccy1_amount = _num_any(lines[i + 7])
+            ccy2 = lines[i + 8].strip().upper()
+            ccy2_amount = _num_any(lines[i + 9])
+            strike = _num_any(lines[i + 10])
+            j = i + 11
+
+            if trade_type != "NDO":
+                i += 1
+                continue
+            if not re.match(r"^[A-Z]{3}/[A-Z]{3}$", curr_pair):
+                i += 1
+                continue
+            if not (_is_ccy_line(ccy1) and _is_ccy_line(ccy2)):
+                i += 1
+                continue
+            if ccy1_amount is None or ccy2_amount is None or strike is None:
+                i += 1
+                continue
+
+            barrier = None
+            # Barrier is optional. When blank, the next cell is Expiry Date.
+            if j < stop and not _is_dd_mmm_yyyy(lines[j]):
+                barrier = _num_any(lines[j])
+                if barrier is None and not _is_pct_line(lines[j]):
+                    barrier = lines[j]
+                j += 1
+
+            expiry_date = lines[j] if j < stop and _is_dd_mmm_yyyy(lines[j]) else None
+            if expiry_date:
+                j += 1
+            value_date = lines[j] if j < stop and _is_dd_mmm_yyyy(lines[j]) else None
+            if value_date:
+                j += 1
+
+            prem_vd = None
+            if j < stop and _is_dd_mmm_yyyy(lines[j]):
+                prem_vd = lines[j]
+                j += 1
+
+            premium_pct = None
+            if j < stop and _is_pct_line(lines[j]):
+                premium_pct = _pct_to_num(lines[j])
+                j += 1
+
+            market_price = _num_any(lines[j]) if j < stop else None
+            if j < stop:
+                j += 1
+            market_value = _num_any(lines[j]) if j < stop else None
+            if j < stop:
+                j += 1
+
+            if market_price is None or market_value is None:
+                i += 1
+                continue
+
+            # Option direction comes from the Buy/Sell column, not the sign of CCY1 amount.
+            qty_abs = abs(ccy1_amount)
+            is_buy = buy_sell.upper().startswith("BUY")
+            long_qty = qty_abs if is_buy else None
+            short_qty = qty_abs if buy_sell.upper().startswith("SELL") else None
+            option_type = "Call" if "CALL" in put_call_raw.upper() else ("Put" if "PUT" in put_call_raw.upper() else None)
+            product = f"FX {curr_pair}"
+            expiry_iso = _normalize_any_date(expiry_date)
+            value_iso = _normalize_any_date(value_date)
+            ref_month = _ref_month_from_date(expiry_date) if expiry_date else (_ref_month_from_date(value_date) if value_date else None)
+            contract_desc = f"NDO {curr_pair} {put_call_raw} Strike {strike:g}" if strike is not None else f"NDO {curr_pair} {put_call_raw}"
+            raw_line = " ".join(lines[i:j])
+
+            row = {
+                "trade_date": trade_date,
+                "trade_date_iso": _normalize_any_date(trade_date, stmt_date),
+                "trade_id": trade_id,
+                "type": "NDO",
+                "trade_type": "NDO",
+                "curr_pair": curr_pair,
+                "buy_sell": buy_sell,
+                "option_type": option_type,
+                "option_type_raw": put_call_raw,
+                "quantity": qty_abs,
+                "long": long_qty,
+                "short": short_qty,
+                "side": buy_sell,
+                "expiry_date": expiry_iso,
+                "expiration_date": expiry_iso,
+                "value_date": value_date,
+                "delivery_date": value_date,
+                "contract_date": value_date,
+                "settlement_date": value_date,
+                "ref_month": ref_month,
+                "contract_month": ref_month.split("-", 1)[0] if ref_month and "-" in ref_month else None,
+                "contract_year": ref_month.split("-", 1)[1] if ref_month and "-" in ref_month else None,
+                "contract_description": contract_desc,
+                "product": product,
+                "product_name": product,
+                "exchange": "FX",
+                "currency": ccy2,
+                "primary_amount": ccy1_amount,
+                "primary_currency": ccy1,
+                "ccy_1": ccy1,
+                "ccy_1_amount": ccy1_amount,
+                "secondary_amount": ccy2_amount,
+                "secondary_currency": ccy2,
+                "ccy_2": ccy2,
+                "ccy_2_amount": ccy2_amount,
+                "strike": strike,
+                "strike_price": strike,
+                "trigger_barrier": barrier,
+                "barrier": barrier,
+                "premium_percent": premium_pct,
+                "premium_pct": premium_pct,
+                "market_price": market_price,
+                "market_value": market_value,
+                "market_value_signed": market_value,
+                "nov": market_value,
+                "statement_date": stmt_date,
+                "account_number": account,
+                "page": page_no,
+                "source_section": "FX Option Open Positions - Non Deliverables",
+                "source_system": "StoneX FX Option NDO",
+                "source_line": raw_line,
+            }
+            rows.append(row)
+            i = j
+            continue
+        except Exception:
+            i += 1
+            continue
+    return rows
+
+
 def _parse_monthly_fx_spot_forward_lines(text: str, stmt_date: str | None, account: str | None, page_no: int) -> list[dict]:
     """Parse StoneX Markets LLC FX Spot/Forward Open Positions rows from text lines.
 
@@ -848,7 +1041,7 @@ def _parse_monthly_fx_spot_forward_lines(text: str, stmt_date: str | None, accou
 
             if ccy1_amount is None or trade_price is None or not _is_ccy_line(ccy2) or ccy2_amount is None:
                 continue
-            if market_price is None or not _is_ccy_line(pnl_ccy) or native_pnl is None or market_value is None:
+            if market_price is None or not _is_ccy_line(pnl_ccy) or market_value is None:
                 continue
 
             product = f"FX {ccy1}/{ccy2}"
@@ -916,13 +1109,14 @@ def extract_monthly(pdf_bytes: bytes, include_open_positions: bool = True) -> Di
         limits = _section_limits(rows, [
             'Commodity New Trades', 'Cash Settlements', 'Commodity Cash Settlements',
             'Realized Gain and Loss', 'Commodity Open Positions',
-            'FX Spot/Forward Open Positions', 'Account Information', 'Disclaimers'
+            'FX Spot/Forward Open Positions', 'FX Option Open Positions - Non Deliverables', 'Account Information', 'Disclaimers'
         ])
         new_start = limits.get('Commodity New Trades', -1)
         cash_start = limits.get('Cash Settlements', 10**9)
         realized_start = limits.get('Realized Gain and Loss', 10**9)
         pos_start = limits.get('Commodity Open Positions', -1)
         fx_spot_start = limits.get('FX Spot/Forward Open Positions', -1)
+        fx_ndo_start = limits.get('FX Option Open Positions - Non Deliverables', -1)
         account_start = limits.get('Account Information', 10**9)
         disclaimer_start = limits.get('Disclaimers', 10**9)
 
@@ -960,7 +1154,7 @@ def extract_monthly(pdf_bytes: bytes, include_open_positions: bool = True) -> Di
                 section = 'Realized Gain and Loss'
             elif include_open_positions and fx_spot_start != -1 and key > fx_spot_start and key < min(account_start, disclaimer_start):
                 section = 'FX Spot/Forward Open Positions'
-            elif include_open_positions and pos_start != -1 and key > pos_start and key < min(account_start, disclaimer_start, fx_spot_start if fx_spot_start != -1 else 10**9):
+            elif include_open_positions and pos_start != -1 and key > pos_start and key < min(account_start, disclaimer_start, fx_spot_start if fx_spot_start != -1 else 10**9, fx_ndo_start if 'fx_ndo_start' in locals() and fx_ndo_start != -1 else 10**9):
                 section = 'Open Positions'
             else:
                 continue
@@ -1083,6 +1277,17 @@ def extract_monthly(pdf_bytes: bytes, include_open_positions: bool = True) -> Di
                     open_pos.append(fx_row)
                     existing_fx.add(fx_key)
 
+        if include_open_positions and ('FX Option Open Positions' in text or ('Put/Call' in text and 'Strike Price' in text and 'NDO' in text)):
+            existing_fx_option = {
+                (r.get('page'), str(r.get('trade_id')), str(r.get('source_section')))
+                for r in open_pos
+            }
+            for fx_row in _parse_monthly_fx_option_ndo_lines(text, stmt_date, account, pno):
+                fx_key = (fx_row.get('page'), str(fx_row.get('trade_id')), str(fx_row.get('source_section')))
+                if fx_key not in existing_fx_option:
+                    open_pos.append(fx_row)
+                    existing_fx_option.add(fx_key)
+
     tables: Dict[str, pd.DataFrame] = {
         'Executed Trades': pd.DataFrame(trades),
         'Purchase & Sale': pd.DataFrame(),
@@ -1099,10 +1304,35 @@ def extract_monthly(pdf_bytes: bytes, include_open_positions: bool = True) -> Di
 
 
 def looks_like_monthly_statement(pdf_bytes: bytes) -> bool:
+    """Detect StoneX Markets LLC / monthly-style statements.
+
+    Earlier versions only checked page 1 for commodity headings.  FX-only
+    Markets LLC statements can show only Account Summary / Account Information
+    on the first pages, with ``Open Positions and Market Values`` and
+    ``FX Spot/Forward Open Positions`` starting several pages later.  Scan a
+    small prefix of pages so those files route to the monthly/Markets parser
+    instead of falling through to the legacy parser.
+    """
     try:
         doc = fitz.open(stream=pdf_bytes, filetype='pdf')
-        text = doc[0].get_text('text')
-        return ('Commodity New Trades' in text or 'Open Positions and Market Values' in text or 'Monthly Statement' in text)
+        page_texts = []
+        for page in list(doc)[:8]:
+            page_texts.append(page.get_text('text'))
+        text = "\n".join(page_texts)
+        markers = (
+            'Commodity New Trades',
+            'Commodity Open Positions',
+            'Open Positions and Market Values',
+            'FX Spot/Forward Open Positions',
+            'FX Spot/Forward New Trades',
+            'FX Option Open Positions',
+            'Monthly Statement',
+        )
+        if any(marker in text for marker in markers):
+            return True
+        return 'StoneX Markets LLC' in text and 'Account Number:' in text and (
+            'FX Spot Forward' in text or 'Curr Pair' in text or 'Market Value of Open' in text
+        )
     except Exception:
         return False
 
@@ -1569,7 +1799,7 @@ def _parse_fx_spot_forward_rows(lines: list[str], stmt_date: str | None, account
             if not (_is_ccy_line(ccy1) and _is_ccy_line(ccy2) and _is_ccy_line(pnl_ccy)):
                 i += 1
                 continue
-            if ccy1_amount is None or ccy2_amount is None or trade_price is None or market_price is None or native_pnl is None or market_value is None:
+            if ccy1_amount is None or ccy2_amount is None or trade_price is None or market_price is None or market_value is None:
                 i += 1
                 continue
 
@@ -2447,11 +2677,10 @@ def _prepared_positions_for_grouping(tables: Dict[str, pd.DataFrame]) -> tuple[p
         expiry_blank = df["expiry_date"].isna() | df["expiry_date"].astype(str).str.strip().str.lower().isin(["", "none", "nan", "nat"])
         df.loc[expiry_blank, "expiry_date"] = parsed_end.loc[expiry_blank]
 
-    # FX rows expose primary/secondary currency and amount fields. Normalize them
-    # here so grouping presets can use the same raw column names regardless of
-    # whether the parser produced primary_amount/secondary_amount or ccy_* aliases.
+    # Normalize instrument type / FX / OTC fields before grouping.
     df = _ensure_fx_position_columns(df)
     df = _ensure_otc_position_columns(df)
+    df = _ensure_position_type_column(df)
 
     df = _add_expiry_or_ref_group_key(df)
 
@@ -2470,11 +2699,14 @@ def _prepared_positions_for_grouping(tables: Dict[str, pd.DataFrame]) -> tuple[p
     df["_non_option_position_rows"] = (~df["_is_option"]).astype(int)
 
     price_col = "trade_price" if "trade_price" in df.columns else ("price" if "price" in df.columns else None)
-    mv_col = "market_value_signed" if "market_value_signed" in df.columns else ("market_value" if "market_value" in df.columns else None)
+    # Use Market Value as the canonical open-trade value for grouping whenever
+    # it is available. Other value fields are only fallback sources if Market Value
+    # is missing for a row.
+    df["_open_trade_value_for_risk"] = _coalesced_open_trade_value(df)
+    mv_col = "_open_trade_value_for_risk" if df["_open_trade_value_for_risk"].notna().any() else None
     if price_col:
         df[price_col] = pd.to_numeric(df[price_col], errors="coerce")
     if mv_col:
-        df[mv_col] = df[mv_col].apply(_num_any)
         mv_values = pd.to_numeric(df[mv_col], errors="coerce")
         df["_nov_value"] = mv_values.where(df["_is_option"], 0.0)
         df["_ote_non_option_value"] = mv_values.where(~df["_is_option"], 0.0)
@@ -2624,22 +2856,21 @@ def _fx_position_mask(df: pd.DataFrame) -> pd.Series:
 def _fx_group_cols_for_base(group_cols: list[str] | None, mode: str = "custom") -> list[str]:
     """Return FX grouping keys for the selected grouped-position view.
 
-    v56 behavior:
-    - Product grouping aggregates all rows with the same FX product/currency pair;
-      it does not split by value date, expiry date, amount, or trade price.
-    - Product + Contract Month/Year groups FX by product/currencies/value date.
-    - Account Grouping additionally keeps account.
-    Currency amount columns are summed in _group_prepared_positions, not used as keys.
+    Product grouping remains a product-level summary. Product + Contract
+    Month/Year and Account Grouping keep FX option/NDO economics by adding
+    Call/Put and strike to the key. Plain FX forwards/spots/swaps have those
+    fields blank, so they continue grouping by product/currencies/expiry only.
     """
     base = [str(c) for c in (group_cols or [])]
     base_set = set(base)
+    fx_option_keys = ["option_type", "strike"]
     if mode == "product_month":
-        return ["product", "ccy_1", "ccy_2", "expiry_date"]
+        return ["product", "position_type", "ccy_1", "ccy_2", "expiry_date"] + fx_option_keys
     if "account_number" in base_set:
-        return ["account_number", "product", "ccy_1", "ccy_2", "expiry_date"]
+        return ["account_number", "product", "position_type", "ccy_1", "ccy_2", "expiry_date"] + fx_option_keys
     if base == ["product"] or base_set == {"product"}:
         return ["product"]
-    return ["product", "ccy_1", "ccy_2", "expiry_date"]
+    return ["product", "position_type", "ccy_1", "ccy_2", "expiry_date"] + fx_option_keys
 
 
 def _group_prepared_positions_with_fx(
@@ -2724,7 +2955,7 @@ def _group_prepared_positions(df: pd.DataFrame, group_cols: list[str], price_col
             agg[amt_col] = "sum"
     # Preserve useful descriptor fields on grouped rows when they are unique inside the group.
     descriptor_cols = [
-        "exchange", "product_name", "contract_description", "currency", "unit", "trigger_barrier", "ref_price", "original_quantity",
+        "exchange", "product_name", "contract_description", "currency", "unit", "type", "position_type", "trade_type", "trigger_barrier", "ref_price", "original_quantity",
         "statement_date", "account_number", "ref_month", "contract_month", "contract_year",
         "option_type", "option_type_raw", "strike", "source_system", "sourceSystem",
         "ccy_1", "ccy_2", "primary_currency", "secondary_currency",
@@ -2768,7 +2999,7 @@ def _group_prepared_positions(df: pd.DataFrame, group_cols: list[str], price_col
 def grouped_positions(tables: Dict[str, pd.DataFrame]) -> pd.DataFrame:
     """Default strike-level grouped open positions."""
     df, price_col, mv_col = _prepared_positions_for_grouping(tables)
-    group_cols = ["statement_date", "account_number", "exchange", "product", "option_type", "ref_month", "strike", "unit"]
+    group_cols = ["statement_date", "account_number", "exchange", "product", "position_type", "option_type", "ref_month", "strike", "unit"]
     group_cols = _expiry_aware_group_cols(group_cols, df)
     return _group_prepared_positions(df, group_cols, price_col, mv_col)
 
@@ -2776,7 +3007,7 @@ def grouped_positions(tables: Dict[str, pd.DataFrame]) -> pd.DataFrame:
 def grouped_positions_by_ref_month(tables: Dict[str, pd.DataFrame]) -> pd.DataFrame:
     """Grouped positions by ref month, including strike price."""
     df, price_col, mv_col = _prepared_positions_for_grouping(tables)
-    group_cols = ["statement_date", "account_number", "exchange", "product", "option_type", "ref_month", "strike", "unit"]
+    group_cols = ["statement_date", "account_number", "exchange", "product", "position_type", "option_type", "ref_month", "strike", "unit"]
     group_cols = _expiry_aware_group_cols(group_cols, df)
     return _group_prepared_positions(df, group_cols, price_col, mv_col)
 
@@ -2784,7 +3015,7 @@ def grouped_positions_by_ref_month(tables: Dict[str, pd.DataFrame]) -> pd.DataFr
 def grouped_positions_by_account(tables: Dict[str, pd.DataFrame]) -> pd.DataFrame:
     """Account-first grouped open positions without strike detail."""
     df, price_col, mv_col = _prepared_positions_for_grouping(tables)
-    group_cols = ["statement_date", "account_number", "exchange", "product", "option_type", "ref_month", "trigger_barrier", "unit"]
+    group_cols = ["statement_date", "account_number", "exchange", "product", "position_type", "option_type", "ref_month", "trigger_barrier", "unit"]
     group_cols = _expiry_aware_group_cols(group_cols, df)
     return _group_prepared_positions(df, group_cols, price_col, mv_col)
 
@@ -2798,7 +3029,7 @@ def grouped_positions_custom(tables: Dict[str, pd.DataFrame], group_cols: list[s
     """
     df, price_col, mv_col = _prepared_positions_for_grouping(tables)
     if not group_cols:
-        group_cols = ["account_number", "product", "option_type", "ref_month"]
+        group_cols = ["account_number", "product", "position_type", "option_type", "ref_month"]
     group_cols = _expiry_aware_group_cols(group_cols, df)
     fx_group_cols = _fx_group_cols_for_base(group_cols)
     return _group_prepared_positions_with_fx(df, group_cols, price_col, mv_col, fx_group_cols=fx_group_cols)
@@ -2808,6 +3039,7 @@ def grouped_positions_custom(tables: Dict[str, pd.DataFrame], group_cols: list[s
 STANDARD_POSITION_COLUMNS = [
     "Contract Description",
     "Product",
+    "Type",
     "Contract Name",
     "Exchange",
     "Currency",
@@ -2845,6 +3077,7 @@ OPEN_POSITION_COLUMNS = [
     "Trade ID",
     "Trade Date",
     "Product",
+    "Type",
     "Contract Description",
     "Exchange",
     "Currency",
@@ -2862,16 +3095,16 @@ OPEN_POSITION_COLUMNS = [
     "Trade Price",
     "Call/Put",
     "strikePrice",
+    "NOV",
     "Unrealised PNL (OTE)",
 ]
 
 GROUPED_POSITION_COLUMNS = [
     "Product",
+    "Type",
     "Contract Month/Year",
     "expiryDate",
     "Trigger/Barrier",
-    "Ref Price",
-    "Original Quantity",
     "CCY 1",
     "CCY 1 Amount",
     "CCY 2",
@@ -2944,6 +3177,164 @@ def _direction_from_net_qty(net_qty: pd.Series) -> pd.Series:
 
 
 
+
+
+
+def _normalize_position_type_value(value):
+    """Normalize raw statement type text into the user-facing Type values."""
+    if value is None:
+        return None
+    try:
+        if pd.isna(value):
+            return None
+    except Exception:
+        pass
+    text = str(value).strip()
+    if not text or text.lower() in {"none", "nan", "nat", "unknown", "other"}:
+        return None
+    upper = re.sub(r"\s+", " ", text.upper())
+    if upper == "MULTIPLE":
+        return "Multiple"
+    if upper in {"FX FWD", "FX FORWARD", "FORWARD"}:
+        return "FX Forward"
+    if upper in {"FX SPOT", "SPOT"}:
+        return "FX Spot"
+    if upper in {"FX SWAP", "FXSWAP", "SWAP FX"}:
+        return "FX Swap"
+    if upper in {"FX NDF", "NDF"}:
+        return "FX NDF"
+    if upper in {"NDO", "FX NDO", "NON DELIVERABLE OPTION", "NON-DELIVERABLE OPTION", "NON DELIVERABLE OPTIONS", "NON-DELIVERABLE OPTIONS"}:
+        return "NDO"
+    if upper.startswith("FX FWD"):
+        return "FX Forward"
+    if upper.startswith("FX SPOT"):
+        return "FX Spot"
+    if upper.startswith("FX SWAP"):
+        return "FX Swap"
+    if upper.startswith("FX NDF"):
+        return "FX NDF"
+    if "ACCUMULATOR" in upper or re.search(r"\bACCUM\b", upper):
+        return "OTC Accumulator"
+    if "OPTION" in upper or upper in {"CALL", "PUT", "C", "P"}:
+        return "Option"
+    if "SWAP" in upper or "OTC" in upper:
+        return "OTC Swap"
+    if upper in {"FUT", "FUTURE", "FUTURES"}:
+        return "Future"
+    return text
+
+
+def _infer_position_type_row(row) -> str | None:
+    """Infer Type for Open Positions and grouped-position descriptor rows."""
+    def get_any(*names):
+        for name in names:
+            try:
+                if name in row.index:
+                    value = row.get(name)
+                    norm = _normalize_position_type_value(value)
+                    if norm:
+                        return norm
+            except Exception:
+                pass
+        return None
+
+    raw_type = get_any("type", "Type", "position_type", "trade_type")
+    desc = ""
+    for name in ["contract_description", "Contract Description", "product", "Product"]:
+        try:
+            if name in row.index and row.get(name) is not None and not pd.isna(row.get(name)):
+                desc = str(row.get(name)).strip()
+                if desc:
+                    break
+        except Exception:
+            pass
+    upper_desc = desc.upper()
+
+    # FX rows: prefer explicit FX type column. If the older FX layout has no
+    # explicit Type, open FX rows are forwards unless the description says Spot/NDF/Swap.
+    is_fx = False
+    for name in ["source_section", "exchange", "Exchange", "product", "Product", "contract_description"]:
+        try:
+            if name in row.index:
+                val = str(row.get(name) or "").upper().strip()
+                if "FX OPEN" in val or val == "FX" or val.startswith("FX"):
+                    is_fx = True
+        except Exception:
+            pass
+    if is_fx:
+        if raw_type == "NDO":
+            return "NDO"
+        if raw_type and raw_type.startswith("FX"):
+            return raw_type
+        if "NDF" in upper_desc:
+            return "FX NDF"
+        if "SWAP" in upper_desc:
+            return "FX Swap"
+        if "SPOT" in upper_desc:
+            return "FX Spot"
+        return "FX Forward"
+
+    # OTC accumulator structures should be identified distinctly from plain OTC swaps
+    # and should override any generic option/swap wording in the description.
+    # Examples include descriptions containing "Accumulator", "Accum", "Daily Consumer Accum",
+    # or "No KO" accumulator language.
+    accumulator_patterns = [
+        r"\bACCUMULATOR\b", r"\bACCUM\b", r"\bDAILY\s+CONSUMER\s+ACCUM\b",
+        r"\bDAILY\s+PRODUCER\s+ACCUM\b", r"\bNO\s+KO\b",
+    ]
+    if any(re.search(pat, upper_desc) for pat in accumulator_patterns):
+        return "OTC Accumulator"
+
+    # Listed options and exchange options.
+    option_text = False
+    for name in ["option_type", "option_type_raw", "call_put", "Call/Put", "C/P"]:
+        try:
+            if name in row.index:
+                val = str(row.get(name) or "").strip().upper()
+                if val in {"C", "P", "CALL", "PUT"}:
+                    option_text = True
+        except Exception:
+            pass
+    if option_text or re.search(r"\b(CALL|PUT|OPTION)\b", upper_desc):
+        return "Option"
+
+    # OTC/swap/structured rows. Examples from the Markets LLC PDFs include
+    # Euro Swap rows and daily consumer/producer structured rows with Trigger/BP/OQ.
+    otc_patterns = [
+        r"\bSWAP\b", r"\bOTC\b",
+        r"\bTRIGGER\b", r"\bDAILY\s+CONS\b", r"\bDAILY\s+PROD\b", r"\bLVL\d*\b",
+        r"\bBP\s*[:=]", r"\bOQ\s*[:=]", r"\bOQ\d+\b",
+    ]
+    if any(re.search(pat, upper_desc) for pat in otc_patterns):
+        return "OTC Swap"
+
+    if raw_type:
+        return raw_type
+    return "Future"
+
+
+def _ensure_position_type_column(df: pd.DataFrame) -> pd.DataFrame:
+    """Add/normalize raw `type` values for Open Positions before display/grouping."""
+    if df is None or df.empty:
+        return df
+    out = df.copy()
+    inferred = out.apply(_infer_position_type_row, axis=1)
+    if "type" in out.columns:
+        current = out["type"].apply(_normalize_position_type_value)
+        missing = current.isna() | current.astype(str).str.strip().str.lower().isin(["", "none", "nan", "nat", "unknown", "other"])
+        out["type"] = current.where(~missing, inferred)
+        # If the contract description identifies an accumulator, that is more
+        # specific than a generic upstream/raw OTC Swap type.
+        accumulator_mask = inferred.astype(str).str.upper().eq("OTC ACCUMULATOR")
+        out["type"] = out["type"].where(~accumulator_mask, inferred)
+    else:
+        out["type"] = inferred
+    # Keep a normalized technical grouping field as well as the user-facing raw
+    # Type field.  Several grouping routines intentionally include
+    # ``position_type`` so FX Spot / FX Forward / FX Swap / NDO rows do not
+    # collapse together when they share the same currency pair and expiry.
+    out["position_type"] = out["type"].apply(_normalize_position_type_value)
+    return out
 
 def _view_has_fx_rows(df: pd.DataFrame) -> bool:
     """Return True when a standardized view contains at least one FX row."""
@@ -3025,12 +3416,14 @@ def _apply_conditional_position_columns(
     if not _view_has_fx_rows(out):
         out = out.drop(columns=fx_cols, errors="ignore")
     if drop_empty_options and not _view_has_option_rows(out):
-        # Hide Call/Put when there are no option rows.  Keep strikePrice when it
+        # Hide Call/Put and NOV when there are no option rows. Keep strikePrice when it
         # contains OTC accumulator/structured-product strike levels.
-        drop_cols = ["Call/Put"]
+        drop_cols = ["Call/Put", "NOV"]
         if "strikePrice" in out.columns and not _series_nonblank(out["strikePrice"]).any():
             drop_cols.append("strikePrice")
         out = out.drop(columns=drop_cols, errors="ignore")
+    elif "NOV" in out.columns and not _series_nonblank(out["NOV"]).any():
+        out = out.drop(columns=["NOV"], errors="ignore")
     if "Trigger/Barrier" in out.columns and not _series_nonblank(out["Trigger/Barrier"]).any():
         out = out.drop(columns=["Trigger/Barrier"], errors="ignore")
     for otc_col in ["Ref Price", "Original Quantity"]:
@@ -3111,6 +3504,182 @@ def _normalize_call_put_series(series: pd.Series) -> pd.Series:
     return series.apply(_normalize_call_put_for_display)
 
 
+
+
+def _position_type_from_row(raw_type=None, desc=None, exchange=None, product=None, option_type=None, source_section=None) -> str | None:
+    """Classify a parsed open-position row into the user-facing Type column."""
+    def clean(v):
+        if v is None:
+            return ""
+        try:
+            if pd.isna(v):
+                return ""
+        except Exception:
+            pass
+        return " ".join(str(v).strip().upper().split())
+
+    raw = clean(raw_type)
+    desc_u = clean(desc)
+    exchange_u = clean(exchange)
+    product_u = clean(product)
+    option_u = clean(option_type)
+    source_u = clean(source_section)
+
+    if raw in {"MULTIPLE", "MIXED"}:
+        return "Multiple"
+    if re.search(r"\b(ACCUMULATOR|ACCUM)\b", raw):
+        return "OTC Accumulator"
+
+    # Explicit FX table types from newer statements.
+    if raw in {"FX FWD", "FWD", "FX FORWARD", "FORWARD"}:
+        return "FX Forward"
+    if raw in {"FX SPOT", "SPOT"}:
+        return "FX Spot"
+    if raw in {"FX NDF", "NDF"}:
+        return "FX NDF"
+    if raw in {"FX SWAP", "FX SWP", "SWAP"} and (exchange_u == "FX" or product_u.startswith("FX")):
+        return "FX Swap"
+
+    # FX rows without an explicit type are forward-style open positions unless
+    # the row itself names spot/swap/NDF.
+    if exchange_u == "FX" or product_u.startswith("FX") or desc_u.startswith("FX") or "FX OPEN POSITIONS" in source_u:
+        blob = " ".join([raw, desc_u, source_u])
+        if re.search(r"\bNDF\b", blob):
+            return "FX NDF"
+        if re.search(r"\bSPOT\b", blob):
+            return "FX Spot"
+        if re.search(r"\bSWAP\b|\bSWP\b", blob):
+            return "FX Swap"
+        return "FX Forward"
+
+    # OTC accumulator structures should be labelled separately from plain OTC swaps.
+    # This catches full "Accumulator" text and abbreviated "Accum" descriptions.
+    if re.search(r"\b(ACCUMULATOR|ACCUM|NO KO|DAILY CONSUMER ACCUM|DAILY PRODUCER ACCUM)\b", desc_u):
+        return "OTC Accumulator"
+
+    # Listed options.
+    if option_u in {"CALL", "PUT", "C", "P"} or re.search(r"\b(CALL|PUT|OPTION|EURO OPTION|EUROPEAN OPTION)\b", desc_u):
+        return "Option"
+
+    # OTC commodity swaps / structured swaps.
+    if re.search(r"\b(SWAP|TRIGGER|BARRIER|LVL\d+|DAILY CONS|DAILY PROD|DAILY CONSUMER|DAILY PRODUCER|RANGE W/)\b", desc_u):
+        return "OTC Swap"
+
+    return "Future"
+
+
+def _infer_position_type_series(df: pd.DataFrame) -> pd.Series:
+    """Return the Type classification for each raw/standard/grouped position row."""
+    if df is None or df.empty:
+        return pd.Series(dtype=object)
+    raw_type = _first_existing(df, ["position_type", "Type", "type", "contract_type", "instrument_type"], default=None)
+    desc = _first_existing(df, ["contract_description", "Contract Description", "product", "Product"], default=None)
+    exchange = _first_existing(df, ["exchange", "Exchange"], default=None)
+    product = _first_existing(df, ["product", "product_name", "Product"], default=None)
+    option_type = _first_existing(df, ["option_type", "option_type_raw", "Call/Put", "call_put"], default=None)
+    source_section = _first_existing(df, ["source_section", "sourceSystem", "source_system"], default=None)
+    return pd.Series(
+        [
+            _position_type_from_row(rt, d, e, p, o, s)
+            for rt, d, e, p, o, s in zip(raw_type, desc, exchange, product, option_type, source_section)
+        ],
+        index=df.index,
+    )
+
+
+
+def _series_to_numeric_any(series: pd.Series) -> pd.Series:
+    """Parse numeric values that may already be floats or statement strings like ($94.37)."""
+    if series is None:
+        return pd.Series(dtype=float)
+    return series.apply(_num_any)
+
+
+def _coalesced_open_trade_value(df: pd.DataFrame, candidates: list[str] | None = None) -> pd.Series:
+    """Return the row-level open trade value used for OTE/NOV allocation.
+
+    Business rule: when Market Value is available, it is the authoritative
+    economic value for both non-option OTE and option NOV. Only fall back to
+    existing OTE/open-trade-equity fields when a Market Value field is absent
+    or blank for that row.
+    """
+    if df is None or df.empty:
+        return pd.Series(dtype=float)
+    candidates = candidates or [
+        "Market Value",
+        "market_value",
+        "MarketValue",
+        "market_value_signed",
+        "open_trade_equity",
+        "unrealized_pnl",
+        "Unrealised PNL (OTE)",
+        "nov",
+        "NOV",
+    ]
+    result = pd.Series([None] * len(df), index=df.index, dtype=object)
+    for col in candidates:
+        if col not in df.columns:
+            continue
+        values = df[col].apply(_num_any)
+        # Only fill blanks. A zero Market Value is a valid available value and
+        # must not be overwritten by another field.
+        result = result.where(~result.isna(), values)
+    return pd.to_numeric(result, errors="coerce")
+
+def _standard_option_row_mask(out: pd.DataFrame) -> pd.Series:
+    """Identify option rows in the standardized position view."""
+    if out is None or out.empty:
+        return pd.Series(dtype=bool)
+    mask = pd.Series(False, index=out.index)
+    if "Type" in out.columns:
+        mask = mask | out["Type"].astype(str).str.strip().str.upper().isin(["OPTION", "NDO"])
+    if "Call/Put" in out.columns:
+        cp = out["Call/Put"].astype(str).str.strip().str.upper()
+        mask = mask | cp.isin(["CALL", "PUT", "C", "P"])
+    if "Contract Description" in out.columns:
+        desc = out["Contract Description"].astype(str).str.upper()
+        mask = mask | desc.str.contains(r"\b(?:CALL|PUT|OPTION)\b", regex=True, na=False)
+    return mask.fillna(False)
+
+
+def _apply_trade_level_nov_ote_split(out: pd.DataFrame) -> pd.DataFrame:
+    """Populate NOV/OTE using Market Value as the authoritative source.
+
+    If Market Value is available on a row, use it directly:
+      - options / NDO rows: Market Value -> NOV, OTE blank
+      - non-options: Market Value -> Unrealised PNL (OTE), NOV blank
+
+    Existing NOV/OTE values are only used when Market Value is absent or blank.
+    """
+    if out is None or out.empty:
+        return out
+    out = out.copy()
+    if "NOV" not in out.columns:
+        out["NOV"] = None
+    if "Unrealised PNL (OTE)" not in out.columns:
+        out["Unrealised PNL (OTE)"] = None
+    if "Market Value" not in out.columns:
+        out["Market Value"] = None
+
+    option_mask = _standard_option_row_mask(out)
+    market_value_numeric = _series_to_numeric_any(out["Market Value"])
+    existing_nov_numeric = _series_to_numeric_any(out["NOV"])
+    existing_ote_numeric = _series_to_numeric_any(out["Unrealised PNL (OTE)"])
+
+    market_available = market_value_numeric.notna()
+
+    # Options / NDOs: NOV is Market Value whenever present.
+    option_nov = existing_nov_numeric.where(~market_available, market_value_numeric)
+    out.loc[option_mask, "NOV"] = option_nov.loc[option_mask]
+    out.loc[option_mask, "Unrealised PNL (OTE)"] = None
+
+    # Non-options: OTE is Market Value whenever present.
+    non_option_mask = ~option_mask
+    non_option_ote = existing_ote_numeric.where(~market_available, market_value_numeric)
+    out.loc[non_option_mask, "Unrealised PNL (OTE)"] = non_option_ote.loc[non_option_mask]
+    out.loc[non_option_mask, "NOV"] = None
+    return out
+
 def standard_position_view_from_df(df: pd.DataFrame) -> pd.DataFrame:
     """Map raw or grouped position rows to the standard Positions schema requested by the user.
 
@@ -3141,9 +3710,12 @@ def standard_position_view_from_df(df: pd.DataFrame) -> pd.DataFrame:
                 out_source[col] = current.where(~missing, parsed[col])
 
     net_qty = _compute_net_qty_for_view(out_source)
-    market_value_signed = _first_existing(out_source, ["market_value_signed", "unrealized_pnl", "open_trade_equity", "market_value"])
-    market_value_display = _first_existing(out_source, ["market_value", "market_value_signed", "unrealized_pnl", "open_trade_equity"])
-    nov = _first_existing(out_source, ["nov", "NOV"])
+    open_trade_value_numeric = _coalesced_open_trade_value(out_source)
+    # Preserve/display Market Value as supplied by the statement/API and use it
+    # as the source for P&L allocation when available.
+    market_value_signed = open_trade_value_numeric
+    market_value_display = _first_existing(out_source, ["market_value", "Market Value", "market_value_signed", "unrealized_pnl", "open_trade_equity"])
+    nov_raw = _first_existing(out_source, ["nov", "NOV", "_nov_value"])
     realised_pnl = _first_existing(out_source, ["realised_pnl", "realized_pnl", "Realised PNL", "Realized PNL"])
     day_pnl = _first_existing(out_source, ["day_pnl", "day_pnl_amount", "Day PNL", "Day P&L"])
 
@@ -3153,6 +3725,24 @@ def standard_position_view_from_df(df: pd.DataFrame) -> pd.DataFrame:
     exchange = _first_existing(out_source, ["exchange"])
     out_source = _ensure_fx_position_columns(out_source)
     out_source = _ensure_otc_position_columns(out_source)
+    out_source = _ensure_position_type_column(out_source)
+    position_type = _first_existing(out_source, ["type", "Type", "position_type", "trade_type"], default=None)
+    position_type = position_type.apply(_normalize_position_type_value)
+
+    # Split Market Value into the correct risk buckets at the row level.
+    # Options / NDOs feed NOV; non-options feed Unrealised PNL (OTE).
+    try:
+        option_mask = _raw_option_position_mask(out_source).reindex(out_source.index, fill_value=False)
+    except Exception:
+        option_mask = pd.Series(False, index=out_source.index)
+    option_mask = option_mask | position_type.astype(str).str.strip().str.upper().isin(["OPTION", "NDO"])
+
+    market_value_numeric = pd.Series(open_trade_value_numeric, index=out_source.index)
+    nov_numeric = nov_raw.apply(_num_any) if hasattr(nov_raw, "apply") else pd.Series([_num_any(nov_raw)] * len(out_source), index=out_source.index)
+    market_value_available = market_value_numeric.notna()
+    nov = nov_numeric.where(~market_value_available, market_value_numeric.where(option_mask, None))
+    market_value_signed = market_value_numeric.where(~option_mask, None)
+
     currency = _first_existing(out_source, ["currency", "unit"])
     trigger_barrier = _first_existing(out_source, ["trigger_barrier", "Trigger/Barrier", "triggerBarrier"], default=None)
     ref_price = _first_existing(out_source, ["ref_price", "Ref Price", "bp", "base_price"], default=None)
@@ -3186,6 +3776,30 @@ def standard_position_view_from_df(df: pd.DataFrame) -> pd.DataFrame:
     call_put = _first_existing(out_source, ["option_type", "option_type_raw", "call_put"])
     call_put = _normalize_call_put_series(call_put)
     strike = _first_existing(out_source, ["strike", "strikePrice"])
+
+    # Correct NOV / OTE allocation at the trade-row level.
+    # Market Value is authoritative whenever present: options / NDOs use it as
+    # NOV, and non-options use it as Unrealised PNL (OTE).
+    try:
+        desc_upper = contract_description.astype(str).str.upper()
+    except Exception:
+        desc_upper = pd.Series([""] * len(out_source), index=out_source.index)
+    type_upper = position_type.astype(str).str.strip().str.upper()
+    call_put_nonblank = call_put.notna() & ~call_put.astype(str).str.strip().str.lower().isin(["", "none", "nan", "nat", "other", "unknown"])
+    option_row_mask = (
+        type_upper.isin(["OPTION", "NDO"])
+        | call_put_nonblank
+        | desc_upper.str.contains(r"\b(?:CALL|PUT|OPTION)\b", regex=True, na=False)
+    )
+    market_value_num = pd.Series(open_trade_value_numeric, index=out_source.index)
+    market_value_available = market_value_num.notna()
+    nov = nov.where(~(option_row_mask & market_value_available), market_value_num)
+    # Keep grouped rows with a real precomputed NOV even if Type is Multiple, but
+    # blank NOV for rows/groups without an option component.
+    nov_has_value = nov.apply(_num_any).notna()
+    nov = nov.where(option_row_mask | nov_has_value, None)
+    unrealised_ote_display = market_value_num.where(~option_row_mask & market_value_available, market_value_signed.where(~option_row_mask, None))
+
     source_system = _first_existing(out_source, ["sourceSystem", "source_system"])
     if source_system.isna().all() if hasattr(source_system, 'isna') else False:
         source_system = pd.Series(["StoneX"] * len(out_source), index=out_source.index)
@@ -3196,6 +3810,7 @@ def standard_position_view_from_df(df: pd.DataFrame) -> pd.DataFrame:
     out = pd.DataFrame({
         "Contract Description": contract_description,
         "Product": product,
+        "Type": position_type,
         "Contract Name": contract_name,
         "Exchange": exchange,
         "Currency": currency,
@@ -3224,11 +3839,12 @@ def standard_position_view_from_df(df: pd.DataFrame) -> pd.DataFrame:
         "sourceSystem": source_system,
         "Direction": direction,
         "NOV": nov,
-        "Unrealised PNL (OTE)": market_value_signed,
+        "Unrealised PNL (OTE)": unrealised_ote_display,
         "Realised PNL": realised_pnl,
         "Day PNL": day_pnl,
         "Market Value": market_value_display,
     })
+    out = _apply_trade_level_nov_ote_split(out)
     if "Avg Fill Price" in out.columns:
         out["Avg Fill Price"] = pd.to_numeric(out["Avg Fill Price"], errors="coerce").round(2)
     if "expiryDate" in out.columns:
@@ -3255,7 +3871,7 @@ def open_positions_standard_view(tables: Dict[str, pd.DataFrame]) -> pd.DataFram
         df["Trade Price"] = df["Avg Fill Price"]
     elif "Trade Price" in df.columns and "Avg Fill Price" in df.columns:
         df["Trade Price"] = df["Trade Price"].where(df["Trade Price"].notna(), df["Avg Fill Price"])
-    df = df.drop(columns=["Avg Fill Price", "Position ID", "Market Value", "Contract Name", "Direction", "NOV", "Realised PNL", "Day PNL", "Settlement Date"], errors="ignore")
+    df = df.drop(columns=["Avg Fill Price", "Position ID", "Market Value", "Contract Name", "Direction", "Realised PNL", "Day PNL", "Settlement Date"], errors="ignore")
     # Keep expiryDate in the Open Positions column list even when the current PDF
     # has no expiry/value/end date; the app hides it by default when blank.
     df = _apply_conditional_position_columns(df, drop_empty_expiry=False)
@@ -3466,9 +4082,9 @@ def prepare_grouped_positions_display(grouped_df: pd.DataFrame, tables: Dict[str
             out["Day PNL"] = None
 
     preset = str(selected_preset or "")
-    # Trade Price is intentionally not shown in grouped-position views; raw trade prices
-    # remain available in Open Positions.
-    out = out.drop(columns=["Trade Price"], errors="ignore")
+    # Trade Price, Ref Price, and Original Quantity remain detail-level Open Positions
+    # fields only; grouped views should not display them.
+    out = out.drop(columns=["Trade Price", "Ref Price", "Original Quantity"], errors="ignore")
 
     if preset in {"Product", "Product + Contract Month/Year"}:
         out = out.drop(columns=["Account Number"], errors="ignore")
@@ -3485,8 +4101,12 @@ def prepare_grouped_positions_display(grouped_df: pd.DataFrame, tables: Dict[str
         out = out.drop(columns=["Contract Month/Year", "expiryDate", "Settlement Date"], errors="ignore")
 
     if drop_option_columns:
+        # Product grouping intentionally hides option detail columns, but NOV must
+        # remain visible when the product contains option value. Do not let the
+        # conditional option-column helper infer "no options" only because Call/Put
+        # and strikePrice were removed for display.
         out = out.drop(columns=["Call/Put", "strikePrice"], errors="ignore")
-    out = _apply_conditional_position_columns(out)
+    out = _apply_conditional_position_columns(out, drop_empty_options=not drop_option_columns)
     ordered = [c for c in GROUPED_POSITION_COLUMNS if c in out.columns]
     ordered += [c for c in out.columns if c not in ordered]
     return out[ordered]
@@ -3499,7 +4119,7 @@ def grouped_positions_standard_view(tables: Dict[str, pd.DataFrame], group_cols:
     grouped = grouped_positions_custom(tables, group_cols)
     df = standard_position_view_from_df(grouped)
     df = _add_grouped_risk_pnl_columns(df, grouped)
-    df = df.drop(columns=["Market Value", "Trade ID", "Contract Name", "Position ID", "Contract Description", "Direction", "Contract Date", "Settlement Date", "Trade Price"], errors="ignore")
+    df = df.drop(columns=["Market Value", "Trade ID", "Contract Name", "Position ID", "Contract Description", "Direction", "Contract Date", "Settlement Date", "Trade Price", "Ref Price", "Original Quantity"], errors="ignore")
     return _apply_conditional_position_columns(df)
 
 
@@ -3559,7 +4179,7 @@ def grouped_positions_product_month_auto_standard_view(tables: Dict[str, pd.Data
     grouped = grouped_positions_product_month_auto(tables)
     df = standard_position_view_from_df(grouped)
     df = _add_grouped_risk_pnl_columns(df, grouped)
-    df = df.drop(columns=["Market Value", "Trade ID", "Contract Name", "Position ID", "Contract Description", "Direction", "Contract Date", "Settlement Date", "Trade Price"], errors="ignore")
+    df = df.drop(columns=["Market Value", "Trade ID", "Contract Name", "Position ID", "Contract Description", "Direction", "Contract Date", "Settlement Date", "Trade Price", "Ref Price", "Original Quantity"], errors="ignore")
     return _apply_conditional_position_columns(df)
 
 
@@ -3724,8 +4344,7 @@ def to_excel_bytes(tables: Dict[str, pd.DataFrame]) -> bytes:
     output = io.BytesIO()
     ordered = {
         "Summary": tables.get("Summary", pd.DataFrame()),
-        "Grouped Trades": grouped_trades(tables),
-        "Grouped Positions": prepare_grouped_positions_display(
+        "Aggregated Positions": prepare_grouped_positions_display(
             grouped_positions_product_month_auto_standard_view(tables),
             tables=tables,
             selected_preset="Product + Contract Month/Year",
@@ -3738,7 +4357,9 @@ def to_excel_bytes(tables: Dict[str, pd.DataFrame]) -> bytes:
         if name == "Summary":
             continue
         if name == "Open Positions":
-            ordered[name] = open_positions_standard_view(tables)
+            ordered["Trades"] = open_positions_standard_view(tables)
+        elif name == "Grouped Trades":
+            continue
         else:
             ordered[name] = df
 

@@ -1,11 +1,20 @@
-# StoneX Statement Trade Extractor
+# StoneX Trades Workbench
 
-Version v67: OTC Trigger/Barrier, Ref Price, Original Quantity, and accumulator strike mapping.
+Version: v76 FX additional types parser
 
-Updates in this version:
-- Trigger/Barrier now stores only the trigger/barrier price.
-- Added Ref Price from BP values.
-- Added Original Quantity from OQ values.
-- Maps OTC accumulator base level, for example `ICE Cotton 0.8456 Daily Consumer Accum...`, to `strikePrice`.
-- Adds Trigger/Barrier price to Account Grouping keys when available.
-- Keeps prior commodity, LME, FX, and grouped drill-down support.
+This Streamlit prototype parses StoneX statement PDFs into trade-level rows, aggregated positions, drill-down details, data quality checks, and exports.
+
+## v76 change
+
+- Added support/routing for StoneX Markets LLC FX-only statements where Account Summary and Account Information pages appear before the FX Open Positions section.
+- Parses FX SPOT, FX FWD, and FX Swap rows from FX Spot/Forward Open Positions.
+- Uses the existing FX grouping logic for these additional FX types.
+- Retains v75 NDO option-aware grouping.
+
+## Run locally
+
+```bash
+pip install -r requirements.txt
+streamlit run app.py
+```
+

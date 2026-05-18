@@ -1,8 +1,9 @@
-"""StoneX Daily Statement trade extractor prototype v2.
+"""MyStoneX Positions statement parser (v76).
 
-Extracts trade-related sections from StoneX Daily Statement PDFs into pandas DataFrames.
-This is a local/offline parser using PyMuPDF text extraction and regex rules tuned to the
-sample statement layout. It keeps source lines and page numbers for audit/reconciliation.
+Extracts trade-related sections from StoneX Daily, Monthly, and IFL statement PDFs into
+pandas DataFrames. This is a local/offline parser using PyMuPDF text extraction and regex
+rules tuned to the sample statement layouts. It keeps source lines and page numbers for
+audit/reconciliation.
 """
 from __future__ import annotations
 
@@ -2461,18 +2462,6 @@ def build_summary(tables: Dict[str, pd.DataFrame]) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def grouped_trades(tables: Dict[str, pd.DataFrame]) -> pd.DataFrame:
-    executed = tables.get("Executed Trades", pd.DataFrame())
-    if executed.empty:
-        return pd.DataFrame()
-    group_cols = [c for c in ["statement_date", "trade_date_iso", "account_number", "account_type", "contract_month", "contract_year", "contract_description", "price", "currency"] if c in executed.columns]
-    agg = {"quantity": "sum"}
-    if "amount_signed" in executed.columns:
-        agg["amount_signed"] = "sum"
-    return executed.groupby(group_cols, dropna=False).agg(agg).reset_index().sort_values(group_cols)
-
-
-
 def _normalize_product_from_description(product_text: str, full_desc: str = "") -> str:
     """Normalize product text from PDF contract description into business product name."""
     raw = " ".join(str(product_text or "").upper().replace("  ", " ").split())
@@ -2994,30 +2983,6 @@ def _group_prepared_positions(df: pd.DataFrame, group_cols: list[str], price_col
         grouped = grouped.drop(columns=["_weighted_price_qty", "_abs_qty"], errors="ignore")
 
     return grouped.sort_values(group_cols).reset_index(drop=True)
-
-
-def grouped_positions(tables: Dict[str, pd.DataFrame]) -> pd.DataFrame:
-    """Default strike-level grouped open positions."""
-    df, price_col, mv_col = _prepared_positions_for_grouping(tables)
-    group_cols = ["statement_date", "account_number", "exchange", "product", "position_type", "option_type", "ref_month", "strike", "unit"]
-    group_cols = _expiry_aware_group_cols(group_cols, df)
-    return _group_prepared_positions(df, group_cols, price_col, mv_col)
-
-
-def grouped_positions_by_ref_month(tables: Dict[str, pd.DataFrame]) -> pd.DataFrame:
-    """Grouped positions by ref month, including strike price."""
-    df, price_col, mv_col = _prepared_positions_for_grouping(tables)
-    group_cols = ["statement_date", "account_number", "exchange", "product", "position_type", "option_type", "ref_month", "strike", "unit"]
-    group_cols = _expiry_aware_group_cols(group_cols, df)
-    return _group_prepared_positions(df, group_cols, price_col, mv_col)
-
-
-def grouped_positions_by_account(tables: Dict[str, pd.DataFrame]) -> pd.DataFrame:
-    """Account-first grouped open positions without strike detail."""
-    df, price_col, mv_col = _prepared_positions_for_grouping(tables)
-    group_cols = ["statement_date", "account_number", "exchange", "product", "position_type", "option_type", "ref_month", "trigger_barrier", "unit"]
-    group_cols = _expiry_aware_group_cols(group_cols, df)
-    return _group_prepared_positions(df, group_cols, price_col, mv_col)
 
 
 def grouped_positions_custom(tables: Dict[str, pd.DataFrame], group_cols: list[str] | None = None) -> pd.DataFrame:
@@ -4380,7 +4345,3 @@ def to_excel_bytes(tables: Dict[str, pd.DataFrame]) -> bytes:
                 ws.column_dimensions[col[0].column_letter].width = width
     output.seek(0)
     return output.getvalue()
-
-
-def extract_to_excel(pdf_bytes: bytes) -> bytes:
-    return to_excel_bytes(extract(pdf_bytes))

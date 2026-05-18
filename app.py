@@ -4,24 +4,22 @@ import html
 from parser import (
     extract,
     to_excel_bytes,
-    grouped_positions_by_ref_month,
-    grouped_positions_custom,
     grouped_positions_standard_view,
     grouped_positions_product_month_auto_standard_view,
     open_positions_standard_view,
-    STANDARD_POSITION_COLUMNS,
     OPEN_POSITION_COLUMNS,
     GROUPED_POSITION_COLUMNS,
     merge_extracted_tables,
-    statement_dates_by_account,
-    realized_pnl_summary,
     prepare_grouped_positions_display,
     standard_position_view_from_df,
 )
 
+APP_VERSION_TAG = "v76"
+APP_VERSION_DESCRIPTION = "FX additional types parser"
+
 st.set_page_config(page_title="MyStoneX Positions", layout="wide")
 st.title("MyStoneX Positions")
-st.caption("Upload one or more StoneX statement PDFs, merge trades, review aggregated positions, drill into details, and export. Version: v76 FX additional types parser.")
+st.caption(f"Upload one or more StoneX statement PDFs, merge trades, review aggregated positions, drill into details, and export. Version: {APP_VERSION_TAG} {APP_VERSION_DESCRIPTION}.")
 
 with st.sidebar:
     st.header("Options")
@@ -410,20 +408,20 @@ def _render_position_search_controls(base_view_df, key_prefix):
         filters["account"] = r1c1.text_input(
             "Account Number contains",
             value="",
-            key=f"{key_prefix_safe}_account_search_v76",
+            key=f"{key_prefix_safe}_account_search_{APP_VERSION_TAG}",
             placeholder="e.g. LME11630",
         )
         filters["product"] = r1c2.text_input(
             "Product contains",
             value="",
-            key=f"{key_prefix_safe}_product_search_v76",
+            key=f"{key_prefix_safe}_product_search_{APP_VERSION_TAG}",
             placeholder="e.g. Coffee, Copper, AUD/USD",
         )
         type_options = _clean_filter_values(base_view_df["Type"]) if "Type" in base_view_df.columns else []
         filters["types"] = r1c3.multiselect(
             "Type",
             options=type_options,
-            key=f"{key_prefix_safe}_type_filter_v76",
+            key=f"{key_prefix_safe}_type_filter_{APP_VERSION_TAG}",
         ) if type_options else []
 
         r2c1, r2c2, r2c3 = st.columns(3)
@@ -431,7 +429,7 @@ def _render_position_search_controls(base_view_df, key_prefix):
         filters["exchanges"] = r2c1.multiselect(
             "Exchange",
             options=exchange_options,
-            key=f"{key_prefix_safe}_exchange_filter_v76",
+            key=f"{key_prefix_safe}_exchange_filter_{APP_VERSION_TAG}",
         ) if exchange_options else []
 
         currency_values = []
@@ -442,19 +440,19 @@ def _render_position_search_controls(base_view_df, key_prefix):
         filters["currencies"] = r2c2.multiselect(
             "Currency",
             options=currency_options,
-            key=f"{key_prefix_safe}_currency_filter_v76",
+            key=f"{key_prefix_safe}_currency_filter_{APP_VERSION_TAG}",
         ) if currency_options else []
 
         date_fields = _date_candidates(base_view_df)
         if date_fields:
-            filters["date_enabled"] = r2c3.checkbox("Filter by date range", key=f"{key_prefix_safe}_date_enabled_v76")
+            filters["date_enabled"] = r2c3.checkbox("Filter by date range", key=f"{key_prefix_safe}_date_enabled_{APP_VERSION_TAG}")
             if filters["date_enabled"]:
-                filters["date_field"] = r2c3.selectbox("Date field", date_fields, key=f"{key_prefix_safe}_date_field_v76")
+                filters["date_field"] = r2c3.selectbox("Date field", date_fields, key=f"{key_prefix_safe}_date_field_{APP_VERSION_TAG}")
                 min_date, max_date = _date_bounds(base_view_df, filters["date_field"])
                 if min_date and max_date:
                     d1, d2 = r2c3.columns(2)
-                    filters["date_from"] = d1.date_input("From", value=min_date, key=f"{key_prefix_safe}_date_from_v76")
-                    filters["date_to"] = d2.date_input("To", value=max_date, key=f"{key_prefix_safe}_date_to_v76")
+                    filters["date_from"] = d1.date_input("From", value=min_date, key=f"{key_prefix_safe}_date_from_{APP_VERSION_TAG}")
+                    filters["date_to"] = d2.date_input("To", value=max_date, key=f"{key_prefix_safe}_date_to_{APP_VERSION_TAG}")
         else:
             r2c3.caption("Date range unavailable")
     return filters
@@ -638,78 +636,6 @@ def display_custom_table(label, df, default_columns=None, default_only=False, se
 
 
 
-
-def _nonblank_filter_options(df, column):
-    if df is None or df.empty or column not in df.columns:
-        return []
-    vals = []
-    for value in df[column].dropna().tolist():
-        text = str(value).strip()
-        if text and text.lower() not in {"none", "nan", "nat", "unknown", "other", "multiple"}:
-            vals.append(text)
-    return sorted(set(vals), key=lambda x: x.upper())
-
-
-def _position_search_mask(df, label, key_prefix):
-    """Search/filter Trades or grouped source rows by account, Type, Exchange."""
-    if df is None or df.empty:
-        return pd.Series(dtype=bool)
-
-    mask = pd.Series(True, index=df.index)
-    key_prefix = _safe_key(key_prefix)
-
-    with st.expander(f"Search / filter {label}", expanded=False):
-        c1, c2, c3 = st.columns(3)
-        account_value = ""
-        selected_types = []
-        selected_exchanges = []
-
-        with c1:
-            if "Account Number" in df.columns:
-                account_value = st.text_input("Account Number contains", key=f"{key_prefix}_account_search")
-            else:
-                st.caption("Account Number not available in this view")
-        with c2:
-            type_options = _nonblank_filter_options(df, "Type")
-            if type_options:
-                selected_types = st.multiselect("Type", type_options, key=f"{key_prefix}_type_filter")
-            else:
-                st.caption("Type not available")
-        with c3:
-            exchange_options = _nonblank_filter_options(df, "Exchange")
-            if exchange_options:
-                selected_exchanges = st.multiselect("Exchange", exchange_options, key=f"{key_prefix}_exchange_filter")
-            else:
-                st.caption("Exchange not available")
-
-        if account_value and "Account Number" in df.columns:
-            mask = mask & df["Account Number"].astype(str).str.contains(account_value, case=False, na=False)
-        if selected_types and "Type" in df.columns:
-            mask = mask & df["Type"].astype(str).isin(selected_types)
-        if selected_exchanges and "Exchange" in df.columns:
-            mask = mask & df["Exchange"].astype(str).isin(selected_exchanges)
-
-        filtered_count = int(mask.sum()) if len(mask) else 0
-        st.caption(f"Matched {filtered_count:,} of {len(df):,} rows.")
-
-    return mask
-
-
-def _filtered_tables_by_open_positions_mask(tables, display_df, mask):
-    """Return a copy of merged tables with Trades filtered by a display-view mask."""
-    if tables is None:
-        return tables
-    if mask is None or len(mask) == 0:
-        return tables
-    raw = tables.get("Open Positions", pd.DataFrame())
-    if raw is None or raw.empty:
-        return tables
-    if len(raw) != len(mask):
-        # If row counts ever diverge, avoid applying a wrong mask.
-        return tables
-    out = dict(tables)
-    out["Open Positions"] = raw.loc[list(mask.to_numpy())].reset_index(drop=True)
-    return out
 
 def _event_selected_rows(event):
     """Return selected row indexes from Streamlit's dataframe selection event."""
@@ -976,7 +902,7 @@ if uploaded_files:
             "Aggregated Positions view",
             options=list(grouping_presets.keys()),
             horizontal=True,
-            key="aggregated_positions_preset_view_v76",
+            key=f"aggregated_positions_preset_view_{APP_VERSION_TAG}",
         )
         preset = grouping_presets[selected_preset]
         if preset["mode"] == "auto_futures_options":
@@ -1008,11 +934,11 @@ if uploaded_files:
             default_columns=grouped_default_columns,
             default_only=True,
             selectable=True,
-            selection_key=f"aggregated_positions_row_selection_{_safe_key(selected_preset)}_v76",
-            table_key_override=f"Aggregated Positions {selected_preset} v76",
+            selection_key=f"aggregated_positions_row_selection_{_safe_key(selected_preset)}_{APP_VERSION_TAG}",
+            table_key_override=f"Aggregated Positions {selected_preset} {APP_VERSION_TAG}",
         )
         latest_aggregated_df = grouped_pos_df.copy()
-        _download_df_csv("Download aggregated positions CSV", grouped_pos_df, f"download_aggregated_positions_{_safe_key(selected_preset)}_v76")
+        _download_df_csv("Download aggregated positions CSV", grouped_pos_df, f"download_aggregated_positions_{_safe_key(selected_preset)}_{APP_VERSION_TAG}")
 
         selected_rows = _event_selected_rows(group_selection)
         selected_group = None
@@ -1058,9 +984,9 @@ if uploaded_files:
             trades_view_df,
             default_columns=_open_positions_default_columns(trades_view_df),
             default_only=True,
-            table_key_override="Trades v76",
+            table_key_override=f"Trades {APP_VERSION_TAG}",
         )
-        _download_df_csv("Download trades CSV", trades_view_df, "download_trades_csv_v76")
+        _download_df_csv("Download trades CSV", trades_view_df, f"download_trades_csv_{APP_VERSION_TAG}")
 
     with tabs[3]:
         st.caption("This section shows the trade-level rows behind the last selected Aggregated Positions row.")
@@ -1079,10 +1005,10 @@ if uploaded_files:
                 drill_df,
                 default_columns=_open_positions_default_columns(drill_df),
                 default_only=False,
-                table_key_override="Position Details Drilldown v76",
+                table_key_override=f"Position Details Drilldown {APP_VERSION_TAG}",
             )
-            _download_df_csv("Download drill-down trades CSV", drill_df, "download_drilldown_csv_v76")
-            if st.button("Clear selected group", key="clear_drilldown_tab_v76"):
+            _download_df_csv("Download drill-down trades CSV", drill_df, f"download_drilldown_csv_{APP_VERSION_TAG}")
+            if st.button("Clear selected group", key=f"clear_drilldown_tab_{APP_VERSION_TAG}"):
                 _close_drilldown()
                 st.rerun()
         else:
@@ -1101,7 +1027,7 @@ if uploaded_files:
             display_custom_table("Data Quality Checks", quality_df, default_only=False)
         with st.expander(f"Exceptions ({len(exceptions_df):,} rows)", expanded=not exceptions_df.empty):
             display_custom_table("Exceptions / Data Quality", exceptions_df, default_only=False)
-            _download_df_csv("Download exceptions CSV", exceptions_df, "download_exceptions_csv_v76")
+            _download_df_csv("Download exceptions CSV", exceptions_df, f"download_exceptions_csv_{APP_VERSION_TAG}")
 
     with tabs[5]:
         st.caption("Download full or view-specific outputs.")
@@ -1110,18 +1036,18 @@ if uploaded_files:
             data=merged_excel,
             file_name="stonex_merged_trades_positions.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            key="download_merged_v76",
+            key=f"download_merged_{APP_VERSION_TAG}",
         )
         st.markdown("**View exports**")
         export_cols = st.columns(3)
         with export_cols[0]:
-            _download_df_csv("Download all trades CSV", open_positions_base_view_df, "download_all_trades_csv_v76")
+            _download_df_csv("Download all trades CSV", open_positions_base_view_df, f"download_all_trades_csv_{APP_VERSION_TAG}")
         with export_cols[1]:
             if 'latest_aggregated_df' in locals() and not latest_aggregated_df.empty:
-                _download_df_csv("Download current aggregated CSV", latest_aggregated_df, "download_current_aggregated_csv_v76")
+                _download_df_csv("Download current aggregated CSV", latest_aggregated_df, f"download_current_aggregated_csv_{APP_VERSION_TAG}")
         with export_cols[2]:
             if 'latest_drill_df' in locals() and not latest_drill_df.empty:
-                _download_df_csv("Download current drill-down CSV", latest_drill_df, "download_current_drilldown_csv_v76")
+                _download_df_csv("Download current drill-down CSV", latest_drill_df, f"download_current_drilldown_csv_{APP_VERSION_TAG}")
 
         with st.expander("Per-file exports"):
             for idx, (uploaded, tables) in enumerate(zip(uploaded_files, extracted_tables), start=1):
@@ -1130,7 +1056,7 @@ if uploaded_files:
                     data=to_excel_bytes(tables),
                     file_name=uploaded.name.rsplit(".", 1)[0] + "_trades.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    key=f"download_{idx}_{uploaded.name}_v76",
+                    key=f"download_{idx}_{uploaded.name}_{APP_VERSION_TAG}",
                 )
 
 

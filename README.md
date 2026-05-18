@@ -1,4 +1,4 @@
-# StoneX Trades Workbench
+# MyStoneX Positions
 
 Version: v76 FX additional types parser
 

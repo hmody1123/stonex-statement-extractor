@@ -543,6 +543,58 @@ def _num_any(value: str | None) -> float | None:
     return -v if neg else v
 
 
+def _murex_num(value: str | None) -> float | None:
+    """Parse Murex-format numeric values with BRL (R$) and USD ($) currency prefixes.
+
+    BRL format uses comma as decimal separator and period as thousands separator,
+    e.g. ``R$ 6.065,98`` -> 6065.98, ``R$ 69,80`` -> 69.80.
+    USD format uses the standard comma-as-thousands convention,
+    e.g. ``$334.2212`` -> 334.2212, ``($250,000.00)`` -> -250000.0.
+    Values with no currency prefix but a single comma and no period (e.g. ``66,79``)
+    are treated as BRL-style decimals.
+    """
+    if value is None:
+        return None
+    s = str(value).strip()
+    if not s or s.lower() in {'none', 'nan', 'nat', ''}:
+        return None
+
+    neg = (s.startswith('(') and s.endswith(')')) or s.startswith('-')
+    s = s.replace('(', '').replace(')', '').lstrip('-').strip()
+
+    # Detect BRL prefix (R$ or R followed by space)
+    is_brl = bool(re.match(r'^R\$?\s', s, re.I))
+    # Strip any leading currency symbols/letters up to first digit
+    s = re.sub(r'^[A-Z€£¥]*\$?\s*', '', s).strip()
+
+    if not s:
+        return None
+
+    if is_brl:
+        # BRL: period = thousands separator, comma = decimal point
+        s = s.replace('.', '').replace(',', '.')
+    elif '.' in s and ',' in s:
+        # Both separators present — determine which is decimal by position
+        if s.rfind(',') > s.rfind('.'):
+            # "1.234,56" style — comma is decimal
+            s = s.replace('.', '').replace(',', '.')
+        else:
+            # "1,234.56" style — period is decimal
+            s = s.replace(',', '')
+    elif ',' in s and '.' not in s:
+        # Comma only — treat as decimal (BRL-style), e.g. "66,79" or "3,007993"
+        s = s.replace(',', '.')
+    else:
+        # Period only or no separator — standard numeric
+        s = s.replace(',', '')
+
+    try:
+        v = float(s)
+        return -v if neg else v
+    except (ValueError, TypeError):
+        return None
+
+
 def _page_header_info(text: str) -> tuple[str | None, str | None]:
     stmt = None
     acct = None
@@ -578,6 +630,26 @@ def _rows_from_words(page):
     out = []
     for key in sorted(buckets):
         items = sorted(buckets[key], key=lambda t: -t[0])  # visual left -> right
+        out.append((key, items, ' '.join(w for _, w in items)))
+    return out
+
+
+def _rows_from_words_standard(page):
+    """Group words into rows for a standard (non-rotated) landscape PDF.
+
+    In PyMuPDF's coordinate system, x0 increases left→right and y0 increases
+    top→bottom.  We group by y0 so each bucket is a visual row; within a row
+    words are sorted left→right by x0.  Returns the same
+    ``[(key, [(x0, word), ...], line_str), ...]`` shape as ``_rows_from_words``.
+    """
+    words = page.get_text('words')
+    buckets: Dict[float, list] = {}
+    for x0, y0, x1, y1, w, *_ in words:
+        key = round(y0 / 3.0) * 3.0          # bucket by visual row (y0 ascending = top→bottom)
+        buckets.setdefault(key, []).append((x0, w))
+    out = []
+    for key in sorted(buckets):               # top → bottom
+        items = sorted(buckets[key])          # left → right by x0
         out.append((key, items, ' '.join(w for _, w in items)))
     return out
 
@@ -777,9 +849,11 @@ def _nearby_monthly_description(rows, idx: int, current_desc: str | None) -> str
 def _section_limits(rows, names):
     out = {}
     for key, items, line in rows:
+        line_ns = line.replace(' ', '')
         for name in names:
-            if name in line and name not in out:
-                out[name] = key
+            if name not in out:
+                if name in line or name.replace(' ', '') in line_ns:
+                    out[name] = key
     return out
 
 
@@ -1100,6 +1174,488 @@ def _parse_monthly_fx_spot_forward_lines(text: str, stmt_date: str | None, accou
     return rows
 
 
+# ---------------------------------------------------------------------------
+# Murex column-position helpers  (standard landscape coordinate system)
+# ---------------------------------------------------------------------------
+# The Murex PDF uses a standard landscape page (1682 × 1189 pts in PyMuPDF).
+# x0 increases left→right (column identity) and y0 increases top→bottom (row
+# identity).  _rows_from_words_standard groups words by y0 so each bucket is
+# a visual row; items within a row are (x0, word) sorted left→right.
+# Column boundaries are therefore x0-based, not y0-based.
+
+# Two-word column header pairs in left→right order (ascending x0)
+_MUREX_TWO_WORD_COLS: Dict[tuple, str] = {
+    ('Trade', 'Date'): 'Trade Date',
+    ('Trade', 'Id'): 'Trade Id',
+    ('Global', 'Id'): 'Global Id',
+    ('Contract', 'Description'): 'Contract Description',
+    ('Start', 'Date'): 'Start Date',
+    ('End', 'Date'): 'End Date',
+    ('Ref', 'Month'): 'Ref Month',
+    ('Native', 'MV'): 'Native MV',
+    ('Market', 'Price'): 'Market Price',
+    ('Trade', 'Price'): 'Trade Price',
+    ('Ccy', '1'): 'Ccy 1',
+    ('Ccy', '2'): 'Ccy 2',
+    ('CCY', '1'): 'Ccy 1',
+    ('CCY', '2'): 'Ccy 2',
+    ('CCY1', 'Buy/(Sell)'): 'Ccy 1 Amt',
+    ('CCY2', 'Buy/(Sell)'): 'Ccy 2 Amt',
+    ('Ccy1', 'Buy/(Sell)'): 'Ccy 1 Amt',
+    ('Ccy2', 'Buy/(Sell)'): 'Ccy 2 Amt',
+}
+
+# Single-word column header tokens
+_MUREX_ONE_WORD_COLS: set = {
+    'Long', 'Short', 'Trigger/Barrier', 'MarketValue', 'Commission', 'Premium',
+    'Buy/(Sell)', 'Sell/(Buy)',  # FX CCY amount sub-columns — needed to create boundary
+    'Type', 'Notional',
+}
+
+# Concatenated two-word headers (PyMuPDF may merge adjacent words with no space char)
+_MUREX_CONCAT_COLS: Dict[str, str] = {
+    'TradeDate': 'Trade Date',
+    'TradeId': 'Trade Id',
+    'GlobalId': 'Global Id',
+    'ContractDescription': 'Contract Description',
+    'StartDate': 'Start Date',
+    'EndDate': 'End Date',
+    'RefMonth': 'Ref Month',
+    'NativeMV': 'Native MV',
+    'MarketPrice': 'Market Price',
+    'TradePrice': 'Trade Price',
+    'Ccy1': 'Ccy 1',
+    'Ccy2': 'Ccy 2',
+    'CCY1': 'Ccy 1',
+    'CCY2': 'Ccy 2',
+}
+
+
+def _murex_build_col_ranges(items: list) -> Dict[str, tuple]:
+    """Build column-name → (x_lo, x_hi) ranges from a Murex header row.
+
+    ``items`` is ``[(x0_float, word_str), ...]`` sorted left→right by x0
+    (as returned by ``_rows_from_words_standard``).
+
+    Adjacent column centres are used to compute midpoint boundaries so that
+    every x-pixel belongs to exactly one column.
+    """
+    col_centers: list[tuple[str, float]] = []
+    # items already sorted left→right (ascending x0)
+    i = 0
+    while i < len(items):
+        x0, w = items[i]
+        # Try two-word column header (consecutive words)
+        if i + 1 < len(items):
+            x1, w1 = items[i + 1]
+            pair = (w, w1)
+            if pair in _MUREX_TWO_WORD_COLS:
+                col_centers.append((_MUREX_TWO_WORD_COLS[pair], (x0 + x1) / 2.0))
+                i += 2
+                continue
+        # Try concatenated two-word header (PyMuPDF merged adjacent words)
+        if w in _MUREX_CONCAT_COLS:
+            col_centers.append((_MUREX_CONCAT_COLS[w], float(x0)))
+            i += 1
+            continue
+        # Try single-word column header
+        if w in _MUREX_ONE_WORD_COLS:
+            col_centers.append((w, float(x0)))
+        i += 1
+
+    if len(col_centers) < 5:
+        return {}
+
+    # Sort by ascending x0 (left → right) and compute midpoint boundaries
+    col_centers.sort(key=lambda t: t[1])
+    result: Dict[str, tuple] = {}
+    for idx, (name, cx) in enumerate(col_centers):
+        x_lo = (cx + col_centers[idx - 1][1]) / 2.0 if idx > 0 else cx - 80.0
+        x_hi = (cx + col_centers[idx + 1][1]) / 2.0 if idx < len(col_centers) - 1 else cx + 80.0
+        result[name] = (x_lo, x_hi)
+    return result
+
+
+def _murex_gcol(items: list, col_ranges: Dict[str, tuple], col_name: str) -> str | None:
+    """Return concatenated words within *col_name*'s x-range from *items*."""
+    rang = col_ranges.get(col_name)
+    if not rang:
+        return None
+    x_lo, x_hi = rang
+    vals = [w for x, w in items if x_lo <= x <= x_hi]
+    return ' '.join(vals).strip() or None
+
+
+def extract_murex_statement(pdf_bytes: bytes, include_open_positions: bool = True) -> Dict[str, pd.DataFrame]:
+    """Parse Murex-format StoneX daily statements.
+
+    Uses the same ``_rows_from_words`` word-position approach as ``extract_monthly``
+    (rotated-landscape coordinate system: x0 = visual row, y0 = visual column).
+    Column positions are discovered dynamically from the header row on each page,
+    so the extractor is robust to minor layout shifts and does not rely on hard-coded
+    y-coordinate ranges.
+
+    Handles both ``Commodity New Trades`` (Commission / Premium columns) and
+    ``Commodity Open Positions`` (Market Price / MarketValue columns) on the same
+    page.  Numeric values with BRL (``R$``) or USD (``$``) prefixes are parsed by
+    ``_murex_num``.
+    """
+    doc = fitz.open(stream=pdf_bytes, filetype='pdf')
+    trades_list: List[dict] = []
+    open_pos_list: List[dict] = []
+
+    for pno, page in enumerate(doc, start=1):
+        text = page.get_text('text')
+        stmt_date, account = _page_header_info(text)
+        # Choose row-grouping axis based on page rotation.
+        # Standard landscape (rotation=0, e.g. G8669 1682×1189): group by y0.
+        # Rotated landscape (rotation=90/270, e.g. daily statements): group by x0.
+        if page.rotation in (90, 270):
+            rows = _rows_from_words(page)
+        else:
+            rows = _rows_from_words_standard(page)
+
+        # ── Detect column layouts for each table section on this page ────────
+        # A page can have two header rows: one for New Trades, one for Open Positions.
+        col_ranges_new: Dict[str, tuple] = {}
+        col_ranges_open: Dict[str, tuple] = {}
+        header_keys: list[float] = []
+
+        # Header row of the FX Option NDO section, when present. The dedicated
+        # NDO parser handles those rows; the commodity column extractor would
+        # mis-read them, so we use this key as an upper bound for the commodity
+        # open-positions section instead.
+        fx_option_header_key: float | None = None
+
+        for key, items, line in rows:
+            lc = ' '.join(line.split())
+            lc_ns = lc.replace(' ', '')
+            has_td = 'Trade Date' in lc or 'TradeDate' in lc_ns
+            has_cd = ('Contract Description' in lc or 'ContractDescription' in lc_ns
+                      or 'CCY1' in lc or 'Ccy1' in lc_ns or 'Ccy 1' in lc)
+            if not has_td or not has_cd:
+                continue
+            # FX Option header signature — leave it for the NDO parser.
+            if (
+                ('Curr Pair' in lc or 'Put/Call' in lc or 'Buy/Sell' in lc)
+                and 'Contract Description' not in lc and 'ContractDescription' not in lc_ns
+            ):
+                if fx_option_header_key is None or key < fx_option_header_key:
+                    fx_option_header_key = key
+                continue
+            cr = _murex_build_col_ranges(items)
+            if not cr:
+                continue
+            header_keys.append(key)
+            if 'Commission' in cr or 'Premium' in cr:
+                col_ranges_new = cr
+            if 'MarketValue' in cr or 'Market Price' in cr:
+                col_ranges_open = cr
+
+        if not col_ranges_new and not col_ranges_open:
+            # Page has only an FX Option header; commodity parser has nothing
+            # to do. The FX NDO parser is invoked unconditionally below.
+            if fx_option_header_key is None:
+                continue
+
+        # ── Detect section boundaries ─────────────────────────────────────────
+        limits = _section_limits(rows, [
+            'Commodity New Trades', 'Commodity Open Positions',
+            'Open Positions and Market Values', 'Itemized Cash',
+            'FX Option Open Positions',
+            'Account Information', 'Disclaimers',
+        ])
+        new_start = limits.get('Commodity New Trades', -1)
+        pos_start = limits.get('Commodity Open Positions', -1)
+        # Continuation pages repeat only the column header row — treat that row
+        # as the start of the open-positions section if no explicit section marker.
+        if pos_start == -1 and col_ranges_open and header_keys:
+            pos_start = min(header_keys)
+        account_end = limits.get('Account Information', 10 ** 9)
+        disclaim_end = limits.get('Disclaimers', 10 ** 9)
+        itemized_end = limits.get('Itemized Cash', 10 ** 9)
+        # An FX Option header on a continuation page (no title text) still bounds
+        # the open-positions section — those rows must go to the NDO parser only.
+        fx_option_start = min(
+            limits.get('FX Option Open Positions', 10 ** 9),
+            fx_option_header_key if fx_option_header_key is not None else 10 ** 9,
+        )
+
+        # ── Parse data rows ───────────────────────────────────────────────────
+        min_header_key = min(header_keys) if header_keys else -1
+
+        def _section_for(k: float) -> str | None:
+            sec: str | None = None
+            if new_start != -1 and k > new_start:
+                upper = min(
+                    pos_start if pos_start != -1 else 10 ** 9,
+                    itemized_end, account_end, disclaim_end, fx_option_start,
+                )
+                if k < upper:
+                    sec = 'new_trades'
+            if include_open_positions and pos_start != -1 and k > pos_start:
+                if k < min(account_end, disclaim_end, fx_option_start):
+                    sec = 'open_positions'
+            if sec is None and col_ranges_open and new_start == -1 and pos_start != -1:
+                if k > pos_start and k < min(account_end, disclaim_end, fx_option_start):
+                    sec = 'open_positions'
+            return sec
+
+        # Identify data-row y-keys (rows with a valid Trade Date) so we can
+        # bound multi-line Contract Description lookups. Some Murex statements
+        # wrap descriptions like "BMF Corn 70.0000 Euro Option Put BRL/BAG - /
+        # Cash Settled" onto y-buckets above and below the data row's y.
+        data_row_keys: list[float] = []
+        for k, its, _ln in rows:
+            if k in header_keys:
+                continue
+            sec = _section_for(k)
+            if sec is None:
+                continue
+            cr = col_ranges_new if sec == 'new_trades' else col_ranges_open
+            if not cr:
+                continue
+            dt = _murex_gcol(its, cr, 'Trade Date')
+            if dt and DATE_DDMMMYYYY_RE.match(dt):
+                data_row_keys.append(k)
+        data_row_keys.sort()
+
+        # Rotation drives in-bucket reading order. Standard landscape pages
+        # read left-to-right (ascending x within a y-bucket); rotated pages
+        # (90/270) read top-to-bottom visually, which is descending y within
+        # an x-bucket because rotation flips the visual y-axis.
+        is_rotated_page = page.rotation in (90, 270)
+        data_row_keys_set = set(data_row_keys)
+
+        def _description_spanning(current_key: float, col_ranges: Dict[str, tuple]) -> str:
+            """Reassemble a wrapped Contract Description.
+
+            For both rotated and standard layouts, the wrap text lives in
+            buckets adjacent to the data row's key. A midpoint cutoff between
+            this data row and its neighbors keeps each row's wrapped text with
+            its own row.
+
+            Words from the data row's OWN bucket are filtered to the Contract
+            Description column range, since that bucket also holds dates,
+            prices, and quantities. Words from neighbor "wrap" buckets — those
+            that aren't themselves data rows — are taken in full, because
+            wrapped description text routinely overflows the column header's
+            bounding box on rotated pages.
+            """
+            rng = col_ranges.get('Contract Description')
+            if not rng:
+                return ''
+            x_lo, x_hi = rng
+            idx = data_row_keys.index(current_key) if current_key in data_row_keys else -1
+            prev_key = data_row_keys[idx - 1] if idx > 0 else (current_key - 24.0)
+            next_key = data_row_keys[idx + 1] if 0 <= idx < len(data_row_keys) - 1 else (current_key + 24.0)
+            lower_bound = (prev_key + current_key) / 2.0
+            upper_bound = (current_key + next_key) / 2.0
+            collected: list[tuple[float, float, str]] = []
+            for k2, its2, _ in rows:
+                if k2 in header_keys:
+                    continue
+                if not (lower_bound < k2 < upper_bound):
+                    continue
+                is_data_bucket = k2 in data_row_keys_set
+                if is_data_bucket:
+                    # The data row's own bucket holds dates/prices/quantities
+                    # alongside any description text. Keep only words inside
+                    # the Contract Description column range.
+                    for x, w in its2:
+                        if x_lo <= x <= x_hi:
+                            collected.append((k2, x, w))
+                else:
+                    # A neighbor bucket is treated as wrapped description text
+                    # only if it has at least one word in the description
+                    # column range. Subtotal rows (which carry "62.50" or
+                    # "($558.84)" in the quantity/value columns but nothing in
+                    # the description column) fail this gate and are skipped.
+                    has_desc_anchor = any(x_lo <= x <= x_hi for x, _ in its2)
+                    if not has_desc_anchor:
+                        continue
+                    # Wrap text routinely overflows the header's bounding box,
+                    # so include every word from this description-only bucket.
+                    for x, w in its2:
+                        collected.append((k2, x, w))
+            # Reading order: outer ascending k2 always. Inner order depends on
+            # rotation — rotated pages read descending y in each x-bucket;
+            # standard pages read ascending x in each y-bucket.
+            inner_sign = -1.0 if is_rotated_page else 1.0
+            collected.sort(key=lambda t: (t[0], inner_sign * t[1]))
+            return ' '.join(w for _, _, w in collected).strip()
+
+        for key, items, line in rows:
+            # Skip header rows themselves
+            if key in header_keys:
+                continue
+
+            section = _section_for(key)
+            if section is None:
+                continue
+
+            col_ranges = col_ranges_new if section == 'new_trades' else col_ranges_open
+            if not col_ranges:
+                continue
+
+            def gcol(name: str) -> str | None:
+                return _murex_gcol(items, col_ranges, name)
+
+            # Trade date must be present and valid
+            date = gcol('Trade Date')
+            if not date or not DATE_DDMMMYYYY_RE.match(date):
+                continue
+
+            # Skip Long Avg / Short Avg summary rows
+            trigger_raw = gcol('Trigger/Barrier')
+            if trigger_raw and re.search(r'\bAvg\b', trigger_raw, re.I):
+                continue
+
+            # Contract Description may wrap onto y-buckets above/below the data
+            # row. Replace the single-bucket value with one that spans the full
+            # row's y-window, so options like "BMF Corn 70.0000 Euro Option Put
+            # BRL/BAG - Cash Settled" are captured even when wrapped.
+            desc = _description_spanning(key, col_ranges) or (gcol('Contract Description') or '')
+            long_qty = _murex_num(gcol('Long'))
+            short_qty = _murex_num(gcol('Short'))
+            if long_qty is not None and short_qty is None:
+                qty = long_qty
+            elif short_qty is not None and long_qty is None:
+                qty = short_qty
+            elif long_qty is not None and short_qty is not None:
+                qty = long_qty - short_qty
+            else:
+                qty = None
+
+            end_date_raw = gcol('End Date')
+            ref_month_raw = gcol('Ref Month')
+            ref_month = _normalize_ref_month(ref_month_raw)
+            end_date_iso = _normalize_any_date(end_date_raw)
+
+            desc_upper = desc.upper()
+            # Accumulator detection — checked before SWAP because descriptions
+            # like "ICE Cotton LVL1 ... Daily Cons Range w/Daily DU" don't
+            # contain the word "Accum" but are still accumulators. Markers:
+            # ACCUM/ACCUMULATOR, LVL\d+ tier, /Trigger:, Daily Cons/Prod,
+            # Daily Consumer/Producer, No KO, BP=/OQ= accumulator footers.
+            is_accumulator = bool(
+                re.search(r'\b(ACCUMULATOR|ACCUM|NO\s+KO)\b', desc_upper)
+                or re.search(r'\bLVL\d+\b', desc_upper)
+                or re.search(r'/TRIGGER\s*:', desc_upper)
+                or re.search(r'\bDAILY\s+(?:CONS|PROD|CONSUMER|PRODUCER)\b', desc_upper)
+                or re.search(r'\b(?:BP|OQ)\s*[:=]', desc_upper)
+            )
+            if is_accumulator:
+                instr_type = 'OTC Accumulator'
+            elif re.search(r'\bSWAP\b', desc_upper):
+                instr_type = 'OTC SWAP'
+            elif re.search(r'\bOPTION\b', desc_upper):
+                instr_type = 'OTC CALL' if 'CALL' in desc_upper else ('OTC PUT' if 'PUT' in desc_upper else 'OTC OPTION')
+            else:
+                instr_type = 'OTC'
+
+            m_prod = re.match(r'^([A-Z]+(?:\s+[A-Za-z][A-Za-z\s]*?)?)\s+(?:[\d.,]+\s+)?Euro\s+', desc, re.I)
+            # Normalize through the central product-name mapping so business
+            # names match across all parsers (e.g. "CBOT Soybean Oil" → "Soybean
+            # Oil"). Otherwise Murex rows would aggregate separately from rows
+            # whose product was set by enrich_open_positions_metadata.
+            product = _normalize_product_from_description(m_prod.group(1), desc) if m_prod else None
+
+            # FX pair detection: use dedicated Ccy 1 / Ccy 2 columns if present.
+            # Only accept the value if it looks like a 3-letter currency code.
+            if not product:
+                _ccy_re = re.compile(r'^[A-Z]{3}$')
+                ccy1_val = (gcol('Ccy 1') or '').strip().upper()
+                ccy2_val = (gcol('Ccy 2') or '').strip().upper()
+                if _ccy_re.match(ccy1_val) and _ccy_re.match(ccy2_val):
+                    product = f'{ccy1_val}/{ccy2_val}'
+                elif _ccy_re.match(ccy1_val):
+                    product = ccy1_val
+
+            option_type: str | None = None
+            strike: float | None = None
+            if 'OPTION' in desc_upper:
+                option_type = 'Call' if 'CALL' in desc_upper else ('Put' if 'PUT' in desc_upper else None)
+                sm = re.search(r'\b([\d.,]+)\s+Euro\s+Option\b', desc, re.I)
+                if sm:
+                    strike = _murex_num(sm.group(1))
+
+            row_dict: dict = {
+                'statement_date': stmt_date,
+                'account_number': account,
+                'page': pno,
+                'trade_date': date,
+                'trade_date_iso': _normalize_any_date(date),
+                'trade_id': gcol('Trade Id'),
+                'global_id': gcol('Global Id'),
+                'long': long_qty,
+                'short': short_qty,
+                'quantity': qty,
+                'contract_description': desc,
+                'start_date': _normalize_any_date(gcol('Start Date')),
+                'expiryDate': end_date_iso,
+                'end_date': end_date_iso,
+                'ref_month': ref_month,
+                'contract_month': ref_month.split('-')[0] if ref_month and '-' in ref_month else None,
+                'contract_year': ref_month.split('-')[1] if ref_month and '-' in ref_month else None,
+                'Type': instr_type,
+                'position_type': instr_type,
+                'product': product,
+                'option_type': option_type,
+                'Call/Put': option_type,
+                'strike': strike,
+                'strikePrice': strike,
+                'source_section': 'Open Positions' if section == 'open_positions' else 'Executed Trades',
+                'source_line': line,
+            }
+
+            if section == 'open_positions':
+                row_dict.update({
+                    'trade_price': _murex_num(gcol('Trade Price')),
+                    'market_price': _murex_num(gcol('Market Price')),
+                    'native_mv': _murex_num(gcol('Native MV')),
+                    'market_value': _murex_num(gcol('MarketValue')),
+                    'market_value_signed': _murex_num(gcol('MarketValue')),
+                })
+                open_pos_list.append(row_dict)
+            else:
+                row_dict.update({
+                    'trade_price': _murex_num(gcol('Trade Price')),
+                    'commission': _murex_num(gcol('Commission')),
+                    'premium': _murex_num(gcol('Premium')),
+                })
+                trades_list.append(row_dict)
+
+        # FX Option NDO rows have their own 18-column layout that the commodity
+        # column extractor cannot read. Route them through the dedicated parser.
+        # Continuation pages omit the section title — match the NDO column-header
+        # signature instead (mirrors _parse_monthly_fx_option_ndo_lines).
+        if include_open_positions and (
+            'FX Option Open Positions' in text
+            or ('Put/Call' in text and 'Strike Price' in text and 'NDO' in text)
+        ):
+            for ndo_row in _parse_monthly_fx_option_ndo_lines(text, stmt_date, account, pno):
+                ndo_row.setdefault('Type', 'NDO')
+                ndo_row.setdefault('position_type', 'NDO')
+                open_pos_list.append(ndo_row)
+
+    tables: Dict[str, pd.DataFrame] = {
+        'Executed Trades': pd.DataFrame(trades_list),
+        'Purchase & Sale': pd.DataFrame(),
+        'Closed Positions': pd.DataFrame(),
+        'Receives Delivers': pd.DataFrame(),
+        'Journal Entries': pd.DataFrame(),
+        'Realized Gain and Loss': pd.DataFrame(),
+        'Realized PNL Summary': pd.DataFrame(),
+        'Open Positions': pd.DataFrame(open_pos_list),
+        'Notes': pd.DataFrame(),
+        'Exceptions': pd.DataFrame(),
+    }
+    tables = enrich_open_positions_metadata(tables)
+    tables['Summary'] = build_summary(tables)
+    return tables
+
+
 def extract_monthly(pdf_bytes: bytes, include_open_positions: bool = True) -> Dict[str, pd.DataFrame]:
     doc = fitz.open(stream=pdf_bytes, filetype='pdf')
     trades, open_pos, cash_settlements, realized, notes, exceptions = [], [], [], [], [], []
@@ -1302,6 +1858,30 @@ def extract_monthly(pdf_bytes: bytes, include_open_positions: bool = True) -> Di
     tables = enrich_open_positions_metadata(tables)
     tables['Summary'] = build_summary(tables)
     return tables
+
+
+def looks_like_murex_statement(pdf_bytes: bytes) -> bool:
+    """Detect Murex-format StoneX daily statements.
+
+    The Murex layout adds a ``Start Date`` column between ``Contract Description``
+    and ``End Date``, which is absent from all other monthly/daily formats.
+    We also require a ``Ref Month`` column header and at least one Commodity
+    section heading so we do not misfire on unrelated PDFs that happen to
+    mention "Start Date".
+    """
+    try:
+        doc = fitz.open(stream=pdf_bytes, filetype='pdf')
+        for page in list(doc)[:5]:
+            text = page.get_text('text')
+            if (
+                'Start Date' in text
+                and 'Ref Month' in text
+                and re.search(r'Commodity\s+(?:New Trades|Open Positions)', text)
+            ):
+                return True
+        return False
+    except Exception:
+        return False
 
 
 def looks_like_monthly_statement(pdf_bytes: bytes) -> bool:
@@ -2116,6 +2696,8 @@ def extract_ifl_statement(pdf_bytes: bytes, include_open_positions: bool = True)
 def extract(pdf_bytes: bytes, include_open_positions: bool = True) -> Dict[str, pd.DataFrame]:
     if looks_like_ifl_statement(pdf_bytes):
         return extract_ifl_statement(pdf_bytes, include_open_positions=include_open_positions)
+    if looks_like_murex_statement(pdf_bytes):
+        return extract_murex_statement(pdf_bytes, include_open_positions=include_open_positions)
     if looks_like_monthly_statement(pdf_bytes):
         return extract_monthly(pdf_bytes, include_open_positions=include_open_positions)
 
@@ -2491,6 +3073,10 @@ def _normalize_product_from_description(product_text: str, full_desc: str = "") 
         "TSR20RUBBR": "TSR20 Rubber",
         "RUBBR": "Rubber",
         "CORN": "Corn",
+        # Multi-word variants must come before the bare "SOYBEAN" entry,
+        # because the lookup uses substring matching.
+        "SOYBEAN OIL": "Soybean Oil",
+        "SOYBEAN MEAL": "Soybean Meal",
         "SOYBEAN": "Soybean",
         "SOYBEANS": "Soybean",
         "CANOLA": "Canola",
@@ -2562,6 +3148,14 @@ def parse_contract_product(desc: str | None) -> dict:
     if strike_value is None:
         strike_value = _extract_otc_strike(desc)
 
+
+    # Murex FX pair format: "USD 15,000,000.00 BRL ..." or "USD (15,000,000.00) BRL ..."
+    murex_fx_m = re.match(r"^([A-Z]{3})\s+\(?[\d,.]+\)?\s+([A-Z]{3})\b", upper)
+    if murex_fx_m:
+        ccy1 = murex_fx_m.group(1).upper()
+        ccy2 = murex_fx_m.group(2).upper()
+        pair = f"{ccy1}/{ccy2}"
+        return {"product": pair, "exchange": "FX", "product_name": pair, "strike": strike_value, "option_type": option_type, "option_style": option_style, "unit": None}
 
     # Special handling for FX rows, e.g. FXCADUSD 13-Nov-26.
     fxm = re.match(r"^(FX[A-Z]{6})\b", upper)
@@ -3016,6 +3610,7 @@ STANDARD_POSITION_COLUMNS = [
     "CCY 2",
     "CCY 2 Amount",
     "expiryDate",
+    "End Date",
     "settlementPrice",
     "Position ID",
     "Trade ID",
@@ -3166,9 +3761,9 @@ def _normalize_position_type_value(value):
         return "FX Spot"
     if upper in {"FX SWAP", "FXSWAP", "SWAP FX"}:
         return "FX Swap"
-    if upper in {"FX NDF", "NDF"}:
+    if upper in {"FX NDF", "NDF FX", "NDF", "NON DELIVERABLE FORWARD", "NON-DELIVERABLE FORWARD", "NON DELIVERABLE FORWARDS", "NON-DELIVERABLE FORWARDS"}:
         return "FX NDF"
-    if upper in {"NDO", "FX NDO", "NON DELIVERABLE OPTION", "NON-DELIVERABLE OPTION", "NON DELIVERABLE OPTIONS", "NON-DELIVERABLE OPTIONS"}:
+    if upper in {"NDO", "FX NDO", "NDO FX", "NON DELIVERABLE OPTION", "NON-DELIVERABLE OPTION", "NON DELIVERABLE OPTIONS", "NON-DELIVERABLE OPTIONS"}:
         return "NDO"
     if upper.startswith("FX FWD"):
         return "FX Forward"
@@ -3176,7 +3771,7 @@ def _normalize_position_type_value(value):
         return "FX Spot"
     if upper.startswith("FX SWAP"):
         return "FX Swap"
-    if upper.startswith("FX NDF"):
+    if upper.startswith("FX NDF") or upper.startswith("NDF FX") or upper.startswith("NDF "):
         return "FX NDF"
     if "ACCUMULATOR" in upper or re.search(r"\bACCUM\b", upper):
         return "OTC Accumulator"
@@ -3241,11 +3836,20 @@ def _infer_position_type_row(row) -> str | None:
 
     # OTC accumulator structures should be identified distinctly from plain OTC swaps
     # and should override any generic option/swap wording in the description.
-    # Examples include descriptions containing "Accumulator", "Accum", "Daily Consumer Accum",
-    # or "No KO" accumulator language.
+    # Examples:
+    #   "ICE Cotton 0.8456 Daily Consumer Accum No KO 50% Upfront ..." (has Accum)
+    #   "ICE Cotton LVL1 0.6625 /Trigger:0.7074 Daily Cons Range w/Daily DU OQ109 BP:68.62"
+    #   "ICE Cotton LVL1 0.7100 /Trigger:0.6632 Daily Prod Range w/Daily DU OQ109 BP:68.62"
+    # The second family carries no "Accum" word but is still an accumulator —
+    # the LVL\d+ tier + /Trigger: + Daily Cons/Prod combination identifies it.
     accumulator_patterns = [
-        r"\bACCUMULATOR\b", r"\bACCUM\b", r"\bDAILY\s+CONSUMER\s+ACCUM\b",
-        r"\bDAILY\s+PRODUCER\s+ACCUM\b", r"\bNO\s+KO\b",
+        r"\bACCUMULATOR\b", r"\bACCUM\b",
+        r"\bDAILY\s+CONSUMER\s+ACCUM\b", r"\bDAILY\s+PRODUCER\s+ACCUM\b",
+        r"\bNO\s+KO\b",
+        r"\bLVL\d+\b",
+        r"/TRIGGER\s*:",
+        r"\bDAILY\s+(?:CONS|PROD|CONSUMER|PRODUCER)\b",
+        r"\b(?:BP|OQ)\s*[:=]",
     ]
     if any(re.search(pat, upper_desc) for pat in accumulator_patterns):
         return "OTC Accumulator"
@@ -3500,7 +4104,7 @@ def _position_type_from_row(raw_type=None, desc=None, exchange=None, product=Non
         return "FX Forward"
     if raw in {"FX SPOT", "SPOT"}:
         return "FX Spot"
-    if raw in {"FX NDF", "NDF"}:
+    if raw in {"FX NDF", "NDF FX", "NDF", "NON DELIVERABLE FORWARD", "NON-DELIVERABLE FORWARD", "NON DELIVERABLE FORWARDS", "NON-DELIVERABLE FORWARDS"}:
         return "FX NDF"
     if raw in {"FX SWAP", "FX SWP", "SWAP"} and (exchange_u == "FX" or product_u.startswith("FX")):
         return "FX Swap"
@@ -3517,9 +4121,17 @@ def _position_type_from_row(raw_type=None, desc=None, exchange=None, product=Non
             return "FX Swap"
         return "FX Forward"
 
-    # OTC accumulator structures should be labelled separately from plain OTC swaps.
-    # This catches full "Accumulator" text and abbreviated "Accum" descriptions.
-    if re.search(r"\b(ACCUMULATOR|ACCUM|NO KO|DAILY CONSUMER ACCUM|DAILY PRODUCER ACCUM)\b", desc_u):
+    # OTC accumulator structures should be labelled separately from plain OTC
+    # swaps. Some accumulators (e.g. "ICE Cotton LVL1 0.6625 /Trigger:0.7074
+    # Daily Cons Range w/Daily DU OQ109 BP:68.62") never spell "Accum", so the
+    # LVL\d+ tier / /Trigger: / Daily Cons|Prod / BP=/OQ= markers also qualify.
+    if re.search(
+        r"\b(ACCUMULATOR|ACCUM|NO KO|DAILY CONSUMER ACCUM|DAILY PRODUCER ACCUM|LVL\d+)\b"
+        r"|/TRIGGER\s*:"
+        r"|\bDAILY\s+(?:CONS|PROD|CONSUMER|PRODUCER)\b"
+        r"|\b(?:BP|OQ)\s*[:=]",
+        desc_u,
+    ):
         return "OTC Accumulator"
 
     # Listed options.
@@ -3527,7 +4139,7 @@ def _position_type_from_row(raw_type=None, desc=None, exchange=None, product=Non
         return "Option"
 
     # OTC commodity swaps / structured swaps.
-    if re.search(r"\b(SWAP|TRIGGER|BARRIER|LVL\d+|DAILY CONS|DAILY PROD|DAILY CONSUMER|DAILY PRODUCER|RANGE W/)\b", desc_u):
+    if re.search(r"\b(SWAP|TRIGGER|BARRIER|RANGE W/)\b", desc_u):
         return "OTC Swap"
 
     return "Future"
@@ -3717,6 +4329,7 @@ def standard_position_view_from_df(df: pd.DataFrame) -> pd.DataFrame:
     ccy_2 = _first_existing(out_source, ["ccy_2", "ccy2", "secondary_currency", "secondary_ccy"], default=None)
     ccy_2_amount = _first_existing(out_source, ["ccy_2_amount", "ccy2_amount", "secondary_amount", "secondary_amount_signed"], default=None)
     expiry_date = _first_existing(out_source, ["expiryDate", "expiry_date", "expiration_date", "value_date", "delivery_date", "contract_date", "end_date"])
+    end_date_value = _first_existing(out_source, ["end_date", "End Date"], default=None)
     settlement_price = _first_existing(out_source, ["settlementPrice", "settlement_price", "closing_price"])
     position_id = _first_existing(out_source, ["card", "trade_id", "global_id", "position_id"])
     trade_id = _first_existing(out_source, ["card", "trade_id", "global_id", "position_id"])
@@ -3787,6 +4400,7 @@ def standard_position_view_from_df(df: pd.DataFrame) -> pd.DataFrame:
         "CCY 2": ccy_2,
         "CCY 2 Amount": ccy_2_amount,
         "expiryDate": expiry_date,
+        "End Date": end_date_value,
         "settlementPrice": settlement_price,
         "Position ID": position_id,
         "Trade ID": trade_id,
@@ -3814,6 +4428,8 @@ def standard_position_view_from_df(df: pd.DataFrame) -> pd.DataFrame:
         out["Avg Fill Price"] = pd.to_numeric(out["Avg Fill Price"], errors="coerce").round(2)
     if "expiryDate" in out.columns:
         out["expiryDate"] = out["expiryDate"].apply(_normalize_any_date)
+    if "End Date" in out.columns:
+        out["End Date"] = out["End Date"].apply(_normalize_any_date)
     return out[STANDARD_POSITION_COLUMNS]
 
 

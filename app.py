@@ -1,6 +1,10 @@
+import json
+
 import streamlit as st
 import pandas as pd
 import html
+
+import data_source as ds
 from parser import (
     extract,
     to_excel_bytes,
@@ -23,26 +27,60 @@ st.caption(f"Upload one or more StoneX statement PDFs, merge trades, review aggr
 
 with st.sidebar:
     st.header("Options")
+    source = st.radio(
+        "Data source",
+        options=["PDF upload", "Internal API"],
+        index=0,
+        key=f"data_source_{APP_VERSION_TAG}",
+    )
     include_trades = st.checkbox("Include trades", value=True)
     show_source_lines = st.checkbox("Show source_line columns", value=False)
     st.markdown("---")
     st.subheader("Multi-PDF merge")
-    st.caption("Trades are always appended from all uploaded PDFs. No latest-snapshot filtering is applied.")
+    st.caption("Trades are always appended from all uploaded PDFs. No latest-snapshot filtering is applied. API mode loads a single response.")
     st.markdown("---")
     st.subheader("Column display")
     st.caption("After upload, use the Customize table button above each table to show/hide columns.")
     st.markdown("---")
     st.caption("Tip: use filters and aggregation views to reconcile trade-level rows back to position exposure.")
 
-uploaded_files = st.file_uploader("Upload one or more statement PDFs", type=["pdf"], accept_multiple_files=True)
-
 def add_source_pdf(tables, pdf_name, pdf_index):
-    for name, df in list(tables.items()):
+    """Return a new dict with source_pdf columns added; never mutate the input.
+
+    The input may come from a Streamlit cache, so mutating it would corrupt the
+    cached value across reruns and across different uploaded PDFs that hash to
+    the same bytes.
+    """
+    out = {}
+    for name, df in tables.items():
         if isinstance(df, pd.DataFrame) and not df.empty:
-            tables[name] = df.copy()
-            tables[name]["source_pdf"] = pdf_name
-            tables[name]["source_pdf_index"] = pdf_index
-    return tables
+            new_df = df.copy()
+            new_df["source_pdf"] = pdf_name
+            new_df["source_pdf_index"] = pdf_index
+            out[name] = new_df
+        else:
+            out[name] = df
+    return out
+
+
+@st.cache_data(show_spinner=False)
+def _cached_extract(pdf_bytes: bytes, include_open_positions: bool):
+    """Cache PDF parsing across reruns so drill-down row clicks don't re-parse.
+
+    Keyed by the raw PDF bytes — Streamlit hashes them automatically. Returns a
+    Dict[str, DataFrame] that callers must not mutate (see add_source_pdf).
+    """
+    return extract(pdf_bytes, include_open_positions=include_open_positions)
+
+
+@st.cache_data(show_spinner=False)
+def _cached_to_excel_bytes(_tables, cache_key: str):
+    """Cache Excel-export byte generation across reruns.
+
+    cache_key carries the identity (typically derived from pdf_bytes hashes and
+    include_open_positions) so Streamlit can invalidate when inputs change.
+    """
+    return to_excel_bytes(_tables)
 
 def clean_for_display(df):
     if df is None:
@@ -840,18 +878,78 @@ def _show_drilldown_widget(drill_df, selected_group_row, selected_preset, sig):
             _render_drilldown_content(drill_df, selected_group_row, selected_preset, sig)
 
 
-if uploaded_files:
-    extracted_tables = []
+def _unwrap_envelope(parsed):
+    """Some API responses wrap rows under 'accountDetails'. Accept both shapes."""
+    if isinstance(parsed, dict) and "accountDetails" in parsed:
+        return parsed["accountDetails"]
+    return parsed if isinstance(parsed, list) else []
 
-    for idx, uploaded in enumerate(uploaded_files, start=1):
-        pdf_bytes = uploaded.read()
-        with st.spinner(f"Extracting {uploaded.name}..."):
-            tables = extract(pdf_bytes, include_open_positions=include_trades)
-            tables = add_source_pdf(tables, uploaded.name, idx)
-            extracted_tables.append(tables)
+
+extracted_tables = []
+pdf_bytes_list: list[bytes] = []
+
+if source == "PDF upload":
+    uploaded_files = st.file_uploader(
+        "Upload one or more statement PDFs",
+        type=["pdf"],
+        accept_multiple_files=True,
+    )
+    if uploaded_files:
+        for idx, uploaded in enumerate(uploaded_files, start=1):
+            pdf_bytes = uploaded.read()
+            pdf_bytes_list.append(pdf_bytes)
+            with st.spinner(f"Extracting {uploaded.name}..."):
+                # Cached call — on the first run for these PDF bytes this
+                # actually parses; subsequent reruns (e.g. drill-down row
+                # clicks) are near-instant.
+                tables = _cached_extract(pdf_bytes, include_trades)
+                tables = add_source_pdf(tables, uploaded.name, idx)
+                extracted_tables.append(tables)
+else:
+    st.info(
+        "Upload JSON responses saved from the Swagger 'Try it out' panel. "
+        "Trades JSON is required; positions JSON is optional and only enriches "
+        "futures/options with product and exchange names. The HTTP fetcher comes next."
+    )
+    trades_file = st.file_uploader(
+        "Trades response (JSON)",
+        type=["json"],
+        key=f"api_trades_{APP_VERSION_TAG}",
+    )
+    positions_file = st.file_uploader(
+        "Positions response (JSON, optional)",
+        type=["json"],
+        key=f"api_positions_{APP_VERSION_TAG}",
+    )
+    if trades_file is not None:
+        try:
+            trades_payload = json.loads(trades_file.read().decode("utf-8"))
+            positions_payload = []
+            if positions_file is not None:
+                positions_payload = json.loads(positions_file.read().decode("utf-8"))
+            trades_json = _unwrap_envelope(trades_payload)
+            positions_json = _unwrap_envelope(positions_payload)
+            with st.spinner("Mapping API response..."):
+                tables = ds.extract_from_api(
+                    positions_json=positions_json,
+                    trades_json=trades_json,
+                )
+                tables = add_source_pdf(tables, f"API:{trades_file.name}", 1)
+                extracted_tables.append(tables)
+        except json.JSONDecodeError as exc:
+            st.error(f"Invalid JSON: {exc}")
+
+
+if extracted_tables:
 
     merged_tables = merge_extracted_tables(extracted_tables)
-    merged_excel = to_excel_bytes(merged_tables)
+    # Excel export is expensive to rebuild on every Streamlit rerun. Key the
+    # cache by the combined identity of the inputs that actually drive output.
+    if source == "PDF upload" and pdf_bytes_list:
+        _excel_cache_key = f"pdf|{include_trades}|{hash(tuple(pdf_bytes_list))}"
+    else:
+        _excel_cache_key = f"api|{include_trades}|{id(merged_tables)}"
+    merged_excel = _cached_to_excel_bytes(merged_tables, _excel_cache_key)
     open_positions_base_view_df = open_positions_standard_view(merged_tables)
     has_option_positions = _has_option_positions(open_positions_base_view_df)
 
@@ -925,7 +1023,7 @@ if uploaded_files:
             st.caption("No option rows detected, so Call/Put and strikePrice are hidden from position views.")
         if selected_preset in {"Product", "Product + Contract Month/Year"}:
             grouped_pos_df = grouped_pos_df.drop(columns=["Account Number"], errors="ignore")
-        grouped_default_columns = [c for c in GROUPED_POSITION_COLUMNS if c in grouped_pos_df.columns]
+        grouped_default_columns = [c for c in GROUPED_POSITION_COLUMNS if c in grouped_pos_df.columns and c != "Type"]
 
         st.caption("Click a row in the Aggregated Positions table to view the trade rows that make up that group.")
         group_selection = display_custom_table(
@@ -1049,20 +1147,24 @@ if uploaded_files:
             if 'latest_drill_df' in locals() and not latest_drill_df.empty:
                 _download_df_csv("Download current drill-down CSV", latest_drill_df, f"download_current_drilldown_csv_{APP_VERSION_TAG}")
 
-        with st.expander("Per-file exports"):
-            for idx, (uploaded, tables) in enumerate(zip(uploaded_files, extracted_tables), start=1):
-                st.download_button(
-                    f"Download Excel for {uploaded.name}",
-                    data=to_excel_bytes(tables),
-                    file_name=uploaded.name.rsplit(".", 1)[0] + "_trades.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    key=f"download_{idx}_{uploaded.name}_{APP_VERSION_TAG}",
-                )
+        if source == "PDF upload":
+            with st.expander("Per-file exports"):
+                for idx, (uploaded, tables) in enumerate(zip(uploaded_files, extracted_tables), start=1):
+                    st.download_button(
+                        f"Download Excel for {uploaded.name}",
+                        data=to_excel_bytes(tables),
+                        file_name=uploaded.name.rsplit(".", 1)[0] + "_trades.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        key=f"download_{idx}_{uploaded.name}_{APP_VERSION_TAG}",
+                    )
 
 
 else:
     st.subheader("Home")
-    st.info("Upload one or more PDFs to begin.")
+    if source == "PDF upload":
+        st.info("Upload one or more PDFs to begin.")
+    else:
+        st.info("Upload a Trades response JSON to begin (positions JSON is optional).")
     st.markdown(
         """
         This prototype is organized around five working sections after upload:
@@ -1073,6 +1175,6 @@ else:
         - **Exceptions / Data Quality** for completeness checks.
         - **Export** for Excel and CSV outputs.
 
-        **Multi-PDF behavior:** trades are appended and de-duplicated when possible. No latest-snapshot filtering is applied.
+        **Sources:** PDF statements (multi-upload merge) or Internal API responses (single response per load). The HTTP fetcher for the API path is coming next; for now upload the saved JSON.
         """
     )

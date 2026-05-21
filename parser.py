@@ -3596,6 +3596,7 @@ def grouped_positions_custom(tables: Dict[str, pd.DataFrame], group_cols: list[s
 
 
 STANDARD_POSITION_COLUMNS = [
+    "Global ID",
     "Contract Description",
     "Product",
     "Type",
@@ -3634,6 +3635,7 @@ STANDARD_POSITION_COLUMNS = [
 
 
 OPEN_POSITION_COLUMNS = [
+    "Global ID",
     "Trade ID",
     "Trade Date",
     "Product",
@@ -3653,6 +3655,7 @@ OPEN_POSITION_COLUMNS = [
     "expiryDate",
     "Contract Month/Year",
     "Trade Price",
+    "settlementPrice",
     "Call/Put",
     "strikePrice",
     "NOV",
@@ -4330,7 +4333,7 @@ def standard_position_view_from_df(df: pd.DataFrame) -> pd.DataFrame:
     ccy_2_amount = _first_existing(out_source, ["ccy_2_amount", "ccy2_amount", "secondary_amount", "secondary_amount_signed"], default=None)
     expiry_date = _first_existing(out_source, ["expiryDate", "expiry_date", "expiration_date", "value_date", "delivery_date", "contract_date", "end_date"])
     end_date_value = _first_existing(out_source, ["end_date", "End Date"], default=None)
-    settlement_price = _first_existing(out_source, ["settlementPrice", "settlement_price", "closing_price"])
+    settlement_price = _first_existing(out_source, ["settlementPrice", "settlement_price", "market_price", "closing_price"])
     position_id = _first_existing(out_source, ["card", "trade_id", "global_id", "position_id"])
     trade_id = _first_existing(out_source, ["card", "trade_id", "global_id", "position_id"])
     account_number = _first_existing(out_source, ["account_number"])
@@ -4385,7 +4388,10 @@ def standard_position_view_from_df(df: pd.DataFrame) -> pd.DataFrame:
     if direction.isna().all() if hasattr(direction, 'isna') else False:
         direction = _direction_from_net_qty(net_qty)
 
+    global_id = _first_existing(out_source, ["global_id", "globalId"])
+
     out = pd.DataFrame({
+        "Global ID": global_id,
         "Contract Description": contract_description,
         "Product": product,
         "Type": position_type,

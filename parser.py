@@ -3600,7 +3600,6 @@ STANDARD_POSITION_COLUMNS = [
     "Contract Description",
     "Product",
     "Type",
-    "Contract Name",
     "Exchange",
     "Currency",
     "Trigger/Barrier",
@@ -3613,7 +3612,6 @@ STANDARD_POSITION_COLUMNS = [
     "expiryDate",
     "End Date",
     "settlementPrice",
-    "Position ID",
     "Trade ID",
     "Trade Date",
     "Account Number",
@@ -4266,10 +4264,8 @@ def standard_position_view_from_df(df: pd.DataFrame) -> pd.DataFrame:
     Mapping assumptions:
     - Contract Description = the exact PDF contract description, reconstructed as month/year + product when needed.
     - Product = normalized product name used for grouping/risk views.
-    - Contract Name = same PDF contract description value retained only for compatibility.
     - expiryDate = true option expiration date or FX value date where available.
     - settlementPrice = settlement/closing price where available; blank when the PDF has no row-level settlement price.
-    - Position ID = card/trade id/global id where available.
     - Trade ID = card from the PDF when available, falling back to trade_id/global_id.
     - Unrealised PNL (OTE) = signed market value when available.
     """
@@ -4301,7 +4297,6 @@ def standard_position_view_from_df(df: pd.DataFrame) -> pd.DataFrame:
 
     contract_description = _pdf_contract_description_for_view(out_source)
     product = _first_existing(out_source, ["product", "product_name"])
-    contract_name = contract_description
     exchange = _first_existing(out_source, ["exchange"])
     out_source = _ensure_fx_position_columns(out_source)
     out_source = _ensure_otc_position_columns(out_source)
@@ -4334,7 +4329,6 @@ def standard_position_view_from_df(df: pd.DataFrame) -> pd.DataFrame:
     expiry_date = _first_existing(out_source, ["expiryDate", "expiry_date", "expiration_date", "value_date", "delivery_date", "contract_date", "end_date"])
     end_date_value = _first_existing(out_source, ["end_date", "End Date"], default=None)
     settlement_price = _first_existing(out_source, ["settlementPrice", "settlement_price", "market_price", "closing_price"])
-    position_id = _first_existing(out_source, ["card", "trade_id", "global_id", "position_id"])
     trade_id = _first_existing(out_source, ["card", "trade_id", "global_id", "position_id"])
     account_number = _first_existing(out_source, ["account_number"])
     # In the StoneX OPEN POSITIONS section, the first TRADE column is the
@@ -4395,7 +4389,6 @@ def standard_position_view_from_df(df: pd.DataFrame) -> pd.DataFrame:
         "Contract Description": contract_description,
         "Product": product,
         "Type": position_type,
-        "Contract Name": contract_name,
         "Exchange": exchange,
         "Currency": currency,
         "Trigger/Barrier": trigger_barrier,
@@ -4408,7 +4401,6 @@ def standard_position_view_from_df(df: pd.DataFrame) -> pd.DataFrame:
         "expiryDate": expiry_date,
         "End Date": end_date_value,
         "settlementPrice": settlement_price,
-        "Position ID": position_id,
         "Trade ID": trade_id,
         "Trade Date": trade_date,
         "Account Number": account_number,
@@ -4446,7 +4438,7 @@ def open_positions_standard_view(tables: Dict[str, pd.DataFrame]) -> pd.DataFram
     - Net Quantity is renamed to Quantity.
     - Contract Description is shown as the PDF-facing instrument detail.
     - Settlement Date is removed from user-facing views.
-    - Position ID and Market Value are hidden/removed from this view.
+    - Market Value is hidden/removed from this view.
     - expiryDate is shown when delivery/value/expiration dates are available.
     - Unrealised PNL (OTE) remains available for position P&L.
     """
@@ -4458,7 +4450,7 @@ def open_positions_standard_view(tables: Dict[str, pd.DataFrame]) -> pd.DataFram
         df["Trade Price"] = df["Avg Fill Price"]
     elif "Trade Price" in df.columns and "Avg Fill Price" in df.columns:
         df["Trade Price"] = df["Trade Price"].where(df["Trade Price"].notna(), df["Avg Fill Price"])
-    df = df.drop(columns=["Avg Fill Price", "Position ID", "Market Value", "Contract Name", "Direction", "Realised PNL", "Day PNL", "Settlement Date"], errors="ignore")
+    df = df.drop(columns=["Avg Fill Price", "Market Value", "Direction", "Realised PNL", "Day PNL", "Settlement Date"], errors="ignore")
     # Keep expiryDate in the Open Positions column list even when the current PDF
     # has no expiry/value/end date; the app hides it by default when blank.
     df = _apply_conditional_position_columns(df, drop_empty_expiry=False)
@@ -4706,7 +4698,7 @@ def grouped_positions_standard_view(tables: Dict[str, pd.DataFrame], group_cols:
     grouped = grouped_positions_custom(tables, group_cols)
     df = standard_position_view_from_df(grouped)
     df = _add_grouped_risk_pnl_columns(df, grouped)
-    df = df.drop(columns=["Market Value", "Trade ID", "Contract Name", "Position ID", "Contract Description", "Direction", "Contract Date", "Settlement Date", "Trade Price", "Ref Price", "Original Quantity"], errors="ignore")
+    df = df.drop(columns=["Market Value", "Trade ID", "Contract Description", "Direction", "Contract Date", "Settlement Date", "Trade Price", "Ref Price", "Original Quantity"], errors="ignore")
     return _apply_conditional_position_columns(df)
 
 
@@ -4766,7 +4758,7 @@ def grouped_positions_product_month_auto_standard_view(tables: Dict[str, pd.Data
     grouped = grouped_positions_product_month_auto(tables)
     df = standard_position_view_from_df(grouped)
     df = _add_grouped_risk_pnl_columns(df, grouped)
-    df = df.drop(columns=["Market Value", "Trade ID", "Contract Name", "Position ID", "Contract Description", "Direction", "Contract Date", "Settlement Date", "Trade Price", "Ref Price", "Original Quantity"], errors="ignore")
+    df = df.drop(columns=["Market Value", "Trade ID", "Contract Description", "Direction", "Contract Date", "Settlement Date", "Trade Price", "Ref Price", "Original Quantity"], errors="ignore")
     return _apply_conditional_position_columns(df)
 
 

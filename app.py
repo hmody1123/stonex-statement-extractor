@@ -15,11 +15,14 @@ from parser import (
     GROUPED_POSITION_COLUMNS,
     merge_extracted_tables,
     prepare_grouped_positions_display,
+    realized_pnl_summary,
     standard_position_view_from_df,
+    closed_positions_standard_view,
+    grouped_realized_pnl_view,
 )
 
-APP_VERSION_TAG = "v76"
-APP_VERSION_DESCRIPTION = "FX additional types parser"
+APP_VERSION_TAG = "v78"
+APP_VERSION_DESCRIPTION = "Realised PNL columns match Aggregated Positions + Debit/Credit"
 
 st.set_page_config(page_title="MyStoneX Positions", layout="wide")
 st.title("MyStoneX Positions")
@@ -69,6 +72,8 @@ def _cached_extract(pdf_bytes: bytes, include_open_positions: bool):
 
     Keyed by the raw PDF bytes — Streamlit hashes them automatically. Returns a
     Dict[str, DataFrame] that callers must not mutate (see add_source_pdf).
+
+    Cache version: v78 (bust after closed_positions_standard_view column rename)
     """
     return extract(pdf_bytes, include_open_positions=include_open_positions)
 
@@ -427,6 +432,7 @@ def _render_position_search_controls(base_view_df, key_prefix):
     """Render account/product/type/exchange/currency/date filters for Trades and Aggregated Positions."""
     filters = {
         "account": "",
+        "broker": "",
         "product": "",
         "types": [],
         "exchanges": [],
@@ -493,6 +499,14 @@ def _render_position_search_controls(base_view_df, key_prefix):
                     filters["date_to"] = d2.date_input("To", value=max_date, key=f"{key_prefix_safe}_date_to_{APP_VERSION_TAG}")
         else:
             r2c3.caption("Date range unavailable")
+
+        r3c1, _, _ = st.columns(3)
+        filters["broker"] = r3c1.text_input(
+            "Broker Code contains",
+            value="",
+            key=f"{key_prefix_safe}_broker_search_{APP_VERSION_TAG}",
+            placeholder="e.g. DP132",
+        )
     return filters
 
 def _position_filter_mask(view_df, filters):
@@ -503,6 +517,10 @@ def _position_filter_mask(view_df, filters):
     account_q = str(filters.get("account") or "").strip()
     if account_q and "Account Number" in view_df.columns:
         mask &= view_df["Account Number"].astype(str).str.contains(account_q, case=False, na=False, regex=False)
+
+    broker_q = str(filters.get("broker") or "").strip()
+    if broker_q and "Broker Code" in view_df.columns:
+        mask &= view_df["Broker Code"].astype(str).str.contains(broker_q, case=False, na=False, regex=False)
 
     product_q = str(filters.get("product") or "").strip()
     if product_q and "Product" in view_df.columns:
@@ -553,6 +571,7 @@ def _apply_position_filters_to_tables(tables, filters):
         return tables
     has_filter = bool(
         str(filters.get("account") or "").strip()
+        or str(filters.get("broker") or "").strip()
         or str(filters.get("product") or "").strip()
         or filters.get("types")
         or filters.get("exchanges")
@@ -963,6 +982,7 @@ if extracted_tables:
         "Home",
         "Aggregated Positions",
         "Trades",
+        "Realised PNL",
         "Position Details / Drill-down",
         "Exceptions / Data Quality",
         "Export",
@@ -994,7 +1014,6 @@ if extracted_tables:
         st.session_state["last_aggregated_filters"] = grouped_filters
         grouped_source_tables = _apply_position_filters_to_tables(merged_tables, grouped_filters)
         grouped_open_base_view_df = open_positions_standard_view(grouped_source_tables)
-        grouped_has_option_positions = _has_option_positions(grouped_open_base_view_df)
 
         selected_preset = st.radio(
             "Aggregated Positions view",
@@ -1018,8 +1037,7 @@ if extracted_tables:
             selected_preset=selected_preset,
             drop_option_columns=(selected_preset == "Product"),
         )
-        grouped_pos_df = _drop_option_columns_when_no_options(grouped_pos_df, grouped_has_option_positions)
-        if not grouped_has_option_positions:
+        if "Call/Put" not in grouped_pos_df.columns:
             st.caption("No option rows detected, so Call/Put and strikePrice are hidden from position views.")
         if selected_preset in {"Product", "Product + Contract Month/Year"}:
             grouped_pos_df = grouped_pos_df.drop(columns=["Account Number"], errors="ignore")
@@ -1066,7 +1084,6 @@ if extracted_tables:
             drill_sig = st.session_state.get("drilldown_signature") or _drilldown_signature(selected_group, selected_preset_for_drill)
             open_df_for_drill = grouped_open_base_view_df
             drill_df = _open_positions_for_group(open_df_for_drill, selected_group, selected_preset_for_drill)
-            drill_df = _drop_option_columns_when_no_options(drill_df, grouped_has_option_positions)
             latest_drill_df = drill_df.copy()
             _show_drilldown_widget(drill_df, selected_group, selected_preset_for_drill, drill_sig)
 
@@ -1087,6 +1104,58 @@ if extracted_tables:
         _download_df_csv("Download trades CSV", trades_view_df, f"download_trades_csv_{APP_VERSION_TAG}")
 
     with tabs[3]:
+        st.caption("Realised P&L from Purchase & Sale (Gross Profit or Loss) rows — parsed using the same column logic as Trades and aggregated using the same presets as Aggregated Positions.")
+
+        realised_source_tables = merged_tables
+
+        # Trade-level view: same parsing pipeline as Trades
+        realised_trade_df = closed_positions_standard_view(realised_source_tables)
+
+        if realised_trade_df is None or realised_trade_df.empty:
+            st.info("No realised P&L rows found in the uploaded statements.")
+        else:
+            total_realised = pd.to_numeric(realised_trade_df.get("Realised PNL", pd.Series(dtype=float)), errors="coerce").sum()
+            r1, r2 = st.columns(2)
+            r1.metric("Realised PNL rows", f"{len(realised_trade_df):,}")
+            r2.metric("Total realised PNL", f"{total_realised:,.2f}")
+
+            # Aggregation presets: same as Aggregated Positions
+            realised_preset_options = {
+                "Product": {"group_cols": ["product"], "mode": "custom"},
+                "Product + Contract Month/Year": {"group_cols": ["product", "ref_month"], "mode": "custom"},
+                "Account Grouping": {"group_cols": ["account_number", "product", "ref_month", "option_type", "strike"], "mode": "custom"},
+            }
+            selected_realised_preset = st.radio(
+                "Realised PNL view",
+                options=list(realised_preset_options.keys()),
+                horizontal=True,
+                key=f"realised_pnl_preset_{APP_VERSION_TAG}",
+            )
+            realised_preset = realised_preset_options[selected_realised_preset]
+
+            # Aggregated view: same grouping rules as Aggregated Positions
+            realised_grouped_df = grouped_realized_pnl_view(
+                realised_source_tables,
+                realised_preset["group_cols"],
+            )
+
+            # Same column order as Aggregated Positions, with "Realised PNL" in place of
+            # "Unrealised PNL (OTE)" and an extra "Debit/Credit" column.
+            _realised_grouped_default_cols = [c for c in (
+                [col for col in GROUPED_POSITION_COLUMNS if col != "Unrealised PNL (OTE)"]
+                + ["Realised PNL", "Debit/Credit"]
+            ) if c in realised_grouped_df.columns]
+
+            display_custom_table(
+                f"Realised PNL — {selected_realised_preset}",
+                realised_grouped_df,
+                default_columns=_realised_grouped_default_cols,
+                default_only=True,
+                table_key_override=f"Realised PNL {selected_realised_preset} {APP_VERSION_TAG}",
+            )
+            _download_df_csv("Download realised PNL CSV", realised_grouped_df, f"download_realised_pnl_csv_{APP_VERSION_TAG}")
+
+    with tabs[4]:
         st.caption("This section shows the trade-level rows behind the last selected Aggregated Positions row.")
         if st.session_state.get("drilldown_row") and st.session_state.get("drilldown_preset"):
             selected_group = pd.Series(st.session_state["drilldown_row"])
@@ -1112,7 +1181,7 @@ if extracted_tables:
         else:
             st.info("Select a row in Aggregated Positions to see the underlying trades here.")
 
-    with tabs[4]:
+    with tabs[5]:
         st.caption("Review parser/data-quality issues and completeness checks.")
         exceptions_df = merged_tables.get("Exceptions", pd.DataFrame())
         q1, q2, q3 = st.columns(3)
@@ -1127,7 +1196,7 @@ if extracted_tables:
             display_custom_table("Exceptions / Data Quality", exceptions_df, default_only=False)
             _download_df_csv("Download exceptions CSV", exceptions_df, f"download_exceptions_csv_{APP_VERSION_TAG}")
 
-    with tabs[5]:
+    with tabs[6]:
         st.caption("Download full or view-specific outputs.")
         st.download_button(
             "Download merged Excel",

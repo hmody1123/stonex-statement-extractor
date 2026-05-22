@@ -31,13 +31,14 @@ def _daily_open_positions_backstop(pdf_bytes: bytes, include_open_positions: boo
             continue
         stmt_date = _statement_date(text)
         account = _account_number(text)
+        broker = _broker_code(text)
         for raw in text.splitlines():
             line = " ".join(raw.strip().split())
             if not line or line.startswith("-------") or line.startswith("TRADE CARD"):
                 continue
             parsed = _parse_daily_open_position_line(line, raw)
             if parsed:
-                row = _base_row(parsed, stmt_date, account, page_no, line)
+                row = _base_row(parsed, stmt_date, account, page_no, line, broker)
                 row["market_value_signed"] = _signed(row.get("market_value"), row.get("drcr"))
                 rows.append(row)
     return rows
@@ -47,6 +48,7 @@ DATE_RE = re.compile(r"(?P<m>JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)\s+
 STATEMENT_DATE_RE = re.compile(r"STATEMENT DATE:\s+" + DATE_RE.pattern, re.I)
 STATEMENT_DATE_DDMMM_RE = re.compile(r"Statement Date:\s+(?P<d>\d{1,2})-(?P<m>[A-Za-z]{3})-(?P<y>\d{4})", re.I)
 ACCOUNT_RE = re.compile(r"ACCOUNT NUMBER:\s+(?P<account>\S+)", re.I)
+SALESMAN_RE = re.compile(r"SALESMAN:\s+(?P<broker>\S+)", re.I)
 
 TRADE_LINE_RE = re.compile(
     r"^(?P<trade_date>\d{1,2}/\d{2}/\d)\s+"
@@ -84,7 +86,7 @@ OPEN_POSITION_LINE_RE = re.compile(
 FEE_OR_AVG_KEYWORDS = ["COMMISSION", "CLEARING FEE", "AVG LONG", "AVG SHORT", "GROSS PROFIT OR LOSS"]
 
 # Purchase & Sale close summary rows are the realized/closed-position details.
-# Examples:
+# Format A (all on one line):
 #   A2 55* 55* LTD- 6/18/26 GROSS PROFIT OR LOSS AD 14,125.00CR
 #   U2 241* 241* LTD- 6/30/26 GROSS PROFIT OR LOSS US 155,735.00CR
 CLOSED_POSITION_GROSS_RE = re.compile(
@@ -93,6 +95,23 @@ CLOSED_POSITION_GROSS_RE = re.compile(
     r"(?:(?P<short>[\d,]+)\*\s+)?"
     r"(?P<close_status>.+?)\s+GROSS\s+PROFIT\s+OR\s+LOSS\s+"
     r"(?P<currency>[A-Z]{2})\s+(?P<amount>[\d,]+(?:\.\d{2})?)(?P<drcr>DR|CR)\s*$",
+    re.I,
+)
+# Format B (standalone line — account type / quantities are on a preceding LTD- line):
+#   GROSS PROFIT OR LOSS US 30,237.50DR
+#   U1 GROSS PROFIT OR LOSS US 30,237.50DR  (account type prefix present but no quantities)
+STANDALONE_GROSS_RE = re.compile(
+    r"^(?:[A-Z]\d\s+)?GROSS\s+PROFIT\s+OR\s+LOSS\s+"
+    r"(?P<currency>[A-Z]{2})\s+(?P<amount>[\d,]+(?:\.\d{2})?)(?P<drcr>DR|CR)\s*$",
+    re.I,
+)
+# LTD- (or EX-) summary line that precedes the standalone GROSS PROFIT OR LOSS line:
+#   U1 20* 20* LTD- 7/14/26
+PS_LTD_SUMMARY_RE = re.compile(
+    r"^(?P<account_type>[A-Z]\d)\s+"
+    r"(?:(?P<long>[\d,]+)\*\s+)?"
+    r"(?:(?P<short>[\d,]+)\*\s+)?"
+    r"(?P<close_status>(?:LTD|EX)-\s*\S+.*?)$",
     re.I,
 )
 
@@ -126,23 +145,51 @@ def _split_amount_drcr(token: str | None) -> tuple[str | None, str | None]:
 
 
 
-def _parse_closed_position_gross_line(line: str, last_contract: dict | None = None) -> dict | None:
-    """Parse P&S GROSS PROFIT OR LOSS lines into closed-position detail rows."""
+def _parse_closed_position_gross_line(
+    line: str,
+    last_contract: dict | None = None,
+    pending_ltd_summary: dict | None = None,
+) -> dict | None:
+    """Parse P&S GROSS PROFIT OR LOSS lines into closed-position detail rows.
+
+    Handles two statement formats:
+    - Format A (all on one line): U1 20* 20* LTD- 7/14/26 GROSS PROFIT OR LOSS US 30,237.50DR
+    - Format B (split lines): standalone GROSS PROFIT OR LOSS US 30,237.50DR where the
+      account type / quantities appeared on a preceding LTD- summary line captured in
+      pending_ltd_summary.
+    """
     m = CLOSED_POSITION_GROSS_RE.match(line)
     if not m:
-        return None
-    row = m.groupdict()
-    row["long"] = _num_any(row.get("long"))
-    row["short"] = _num_any(row.get("short"))
-    row["quantity"] = (row.get("long") or 0) - (row.get("short") or 0)
-    row["realized_pnl"] = _signed(row.get("amount"), row.get("drcr"))
+        # Format B: standalone GROSS PROFIT OR LOSS line
+        m2 = STANDALONE_GROSS_RE.match(line)
+        if not m2:
+            return None
+        row: dict = m2.groupdict()
+        row["account_type"] = None
+        row["close_status"] = None
+        # Absorb quantities and close-date from the preceding LTD- line if available
+        if pending_ltd_summary:
+            row["account_type"] = pending_ltd_summary.get("account_type")
+            row["long"]         = _num_any(pending_ltd_summary.get("long"))
+            row["short"]        = _num_any(pending_ltd_summary.get("short"))
+            row["close_status"] = pending_ltd_summary.get("close_status")
+        else:
+            row["long"] = None
+            row["short"] = None
+    else:
+        row = m.groupdict()
+        row["long"]  = _num_any(row.get("long"))
+        row["short"] = _num_any(row.get("short"))
+
+    row["quantity"]      = (row.get("long") or 0) - (row.get("short") or 0)
+    row["realized_pnl"]  = _signed(row.get("amount"), row.get("drcr"))
     row["amount_signed"] = row["realized_pnl"]
     row["source_section"] = "Closed Positions"
-    row["pnl_view"] = "Closed Position Detail"
+    row["pnl_view"]       = "Closed Position Detail"
 
     status = str(row.get("close_status") or "")
-    mdate = re.search(r"(\d{1,2}/\d{1,2}/\d{2,4})", status)
-    row["close_date"] = mdate.group(1) if mdate else None
+    mdate  = re.search(r"(\d{1,2}/\d{1,2}/\d{2,4})", status)
+    row["close_date"]  = mdate.group(1) if mdate else None
     mclose = re.search(r"\bCLOSE\s+(?P<close_price>[-+]?\d+(?:\.\d+)?)", status)
     row["close_price"] = _num_any(mclose.group("close_price")) if mclose else None
 
@@ -150,7 +197,7 @@ def _parse_closed_position_gross_line(line: str, last_contract: dict | None = No
         for k in [
             "contract_description", "contract_month", "contract_year", "ref_month",
             "trade_id", "card", "price", "trade_price", "product", "exchange",
-            "option_type", "strike"
+            "option_type", "strike",
         ]:
             if k in last_contract and row.get(k) in (None, ""):
                 row[k] = last_contract.get(k)
@@ -360,6 +407,11 @@ def _account_number(page_text: str) -> str | None:
     return match.group("account") if match else None
 
 
+def _broker_code(page_text: str) -> str | None:
+    match = SALESMAN_RE.search(page_text)
+    return match.group("broker") if match else None
+
+
 def _normalize_trade_date(short_date: str, statement_date: str | None) -> str:
     mm, dd, y1 = short_date.split("/")
     year = int(statement_date[:3] + y1) if statement_date else 2020 + int(y1)
@@ -505,10 +557,11 @@ def pdf_text(pdf_bytes: bytes) -> List[Tuple[int, str]]:
     return [(i + 1, page.get_text("text")) for i, page in enumerate(doc)]
 
 
-def _base_row(groupdict: dict, stmt_date: str | None, account: str | None, page_no: int, raw_line: str) -> dict:
+def _base_row(groupdict: dict, stmt_date: str | None, account: str | None, page_no: int, raw_line: str, broker: str | None = None) -> dict:
     row = dict(groupdict)
     row["statement_date"] = stmt_date
     row["account_number"] = account
+    row["broker_code"] = broker
     row["trade_date_iso"] = _normalize_any_date(row.get("trade_date"), stmt_date)
     row["quantity"] = _to_num(row.get("quantity"))
     if "price" in row:
@@ -1936,7 +1989,7 @@ def _is_ccy_line(s: str) -> bool:
     return bool(re.match(r"^[A-Z]{3}$", str(s).strip()))
 
 
-def _parse_lme_open_positions_from_lines(lines: list[str], stmt_date: str | None, account: str | None, page_no: int) -> list[dict]:
+def _parse_lme_open_positions_from_lines(lines: list[str], stmt_date: str | None, account: str | None, page_no: int, broker: str | None = None) -> list[dict]:
     """Parse metal/LME open positions where PyMuPDF splits each visual row into multiple text lines."""
     rows: list[dict] = []
     section: str | None = None
@@ -1991,6 +2044,7 @@ def _parse_lme_open_positions_from_lines(lines: list[str], stmt_date: str | None
                         "market_value_signed": _num_any(amount),
                         "statement_date": stmt_date,
                         "account_number": account,
+                        "broker_code": broker,
                         "page": page_no,
                         "source_section": "Futures / Options Open Positions",
                         "source_line": raw_line,
@@ -2053,6 +2107,7 @@ def _parse_lme_open_positions_from_lines(lines: list[str], stmt_date: str | None
                         "market_value_signed": _num_any(amount),
                         "statement_date": stmt_date,
                         "account_number": account,
+                        "broker_code": broker,
                         "page": page_no,
                         "source_section": "LME Average Open Positions",
                         "source_line": raw_line,
@@ -2712,10 +2767,12 @@ def extract(pdf_bytes: bytes, include_open_positions: bool = True) -> Dict[str, 
 
     pending_lme_avg: dict | None = None
     last_purchase_sale_contract: dict | None = None
+    pending_ps_ltd_summary: dict | None = None  # LTD- line preceding a standalone GROSS PROFIT OR LOSS
 
     for page_no, text in pdf_text(pdf_bytes):
         stmt_date = _statement_date(text)
         account = _account_number(text)
+        broker = _broker_code(text)
         section: str | None = None
         saw_stmt = bool(stmt_date)
         # Do not enter the OPEN section just because the page contains the OPEN header;
@@ -2724,7 +2781,7 @@ def extract(pdf_bytes: bytes, include_open_positions: bool = True) -> Dict[str, 
 
         normalized_lines = [" ".join(raw.strip().split()) for raw in text.splitlines() if " ".join(raw.strip().split())]
         if include_open_positions and ("LME AVERAGE OPEN POSITIONS" in text or "FUTURES / OPTIONS OPEN POSITIONS" in text):
-            open_positions.extend(_parse_lme_open_positions_from_lines(normalized_lines, stmt_date, account, page_no))
+            open_positions.extend(_parse_lme_open_positions_from_lines(normalized_lines, stmt_date, account, page_no, broker))
 
         raw_lines = text.splitlines()
         i = 0
@@ -2779,7 +2836,7 @@ def extract(pdf_bytes: bytes, include_open_positions: bool = True) -> Dict[str, 
                 match = TRADE_LINE_RE.match(line)
                 parsed_trade = match.groupdict() if match else _parse_daily_trade_or_ps_line(line)
                 if parsed_trade:
-                    row = _base_row(parsed_trade, stmt_date, account, page_no, line)
+                    row = _base_row(parsed_trade, stmt_date, account, page_no, line, broker)
                     row["source_section"] = "Executed Trades" if section == "executed" else "Purchase & Sale"
                     row["side"] = _side_from_section(section, row.get("quantity"))
                     # Classic daily statements print the actual card/trade id on the next line.
@@ -2799,9 +2856,13 @@ def extract(pdf_bytes: bytes, include_open_positions: bool = True) -> Dict[str, 
                     else:
                         executed.append(row)
                 elif section == "purchase_sale" and "GROSS PROFIT OR LOSS" in line:
-                    closed = _parse_closed_position_gross_line(line, last_purchase_sale_contract)
+                    # Format A: all on one line  e.g. "U1 20* 20* LTD- 6/30/26 GROSS PROFIT OR LOSS US 30,237.50DR"
+                    # Format B: standalone line  e.g. "GROSS PROFIT OR LOSS US 30,237.50DR"
+                    #   (quantities/close-date were on a preceding LTD- line stored in pending_ps_ltd_summary)
+                    closed = _parse_closed_position_gross_line(line, last_purchase_sale_contract, pending_ps_ltd_summary)
+                    pending_ps_ltd_summary = None  # consumed regardless
                     if closed:
-                        row = _base_row(closed, stmt_date, account, page_no, line)
+                        row = _base_row(closed, stmt_date, account, page_no, line, broker)
                         row["realized_pnl"] = closed.get("realized_pnl")
                         row["amount_signed"] = closed.get("amount_signed")
                         row["pnl_view"] = "Closed Position Detail"
@@ -2810,6 +2871,12 @@ def extract(pdf_bytes: bytes, include_open_positions: bool = True) -> Dict[str, 
                             if row.get(meta_col) in (None, "", "Other"):
                                 row[meta_col] = meta_val
                         closed_positions.append(row)
+                    notes.append({"statement_date": stmt_date, "account_number": account, "page": page_no, "section": section, "text": line})
+                elif section == "purchase_sale" and PS_LTD_SUMMARY_RE.match(line) and "GROSS PROFIT OR LOSS" not in line:
+                    # Format B LTD- summary line (no GROSS PROFIT on this line):
+                    # store quantities + close date for the next GROSS PROFIT OR LOSS line.
+                    ltd_m = PS_LTD_SUMMARY_RE.match(line)
+                    pending_ps_ltd_summary = ltd_m.groupdict() if ltd_m else None
                     notes.append({"statement_date": stmt_date, "account_number": account, "page": page_no, "section": section, "text": line})
                 elif any(keyword in line for keyword in FEE_OR_AVG_KEYWORDS):
                     notes.append({"statement_date": stmt_date, "account_number": account, "page": page_no, "section": section, "text": line})
@@ -2824,7 +2891,7 @@ def extract(pdf_bytes: bytes, include_open_positions: bool = True) -> Dict[str, 
             elif section == "receives_delivers":
                 match = RD_LINE_RE.match(line)
                 if match:
-                    row = _base_row(match.groupdict(), stmt_date, account, page_no, line)
+                    row = _base_row(match.groupdict(), stmt_date, account, page_no, line, broker)
                     receives_delivers.append(row)
                 elif re.match(r"^\d{1,2}/\d{2}/\d\s+", line):
                     exceptions.append({"statement_date": stmt_date, "account_number": account, "page": page_no, "section": section, "reason": "Unmatched receive/deliver line", "source_line": line})
@@ -2832,7 +2899,7 @@ def extract(pdf_bytes: bytes, include_open_positions: bool = True) -> Dict[str, 
             elif section == "journal":
                 match = JOURNAL_RE.match(line)
                 if match:
-                    row = _base_row(match.groupdict(), stmt_date, account, page_no, line)
+                    row = _base_row(match.groupdict(), stmt_date, account, page_no, line, broker)
                     journals.append(row)
                 elif re.match(r"^\d{1,2}/\d{2}/\d\s+", line):
                     exceptions.append({"statement_date": stmt_date, "account_number": account, "page": page_no, "section": section, "reason": "Unmatched journal line", "source_line": line})
@@ -2840,7 +2907,7 @@ def extract(pdf_bytes: bytes, include_open_positions: bool = True) -> Dict[str, 
             elif section == "lme_fut_opt_open" and include_open_positions:
                 parsed = _parse_lme_fut_opt_row(line)
                 if parsed:
-                    row = _base_row(parsed, stmt_date, account, page_no, line)
+                    row = _base_row(parsed, stmt_date, account, page_no, line, broker)
                     row["quantity"] = _num_any(parsed.get("quantity"))
                     row["market_value"] = _num_any(parsed.get("market_value"))
                     row["market_value_signed"] = _num_any(parsed.get("market_value"))
@@ -2855,7 +2922,7 @@ def extract(pdf_bytes: bytes, include_open_positions: bool = True) -> Dict[str, 
                     pending_lme_avg["delivery_date"] = prod_match.group("delivery_date")
                     pending_lme_avg["contract_date"] = prod_match.group("delivery_date")
                     pending_lme_avg["contract_description"] = prod_match.group("product")
-                    row = _base_row(pending_lme_avg, stmt_date, account, page_no, pending_lme_avg.get("source_line", line))
+                    row = _base_row(pending_lme_avg, stmt_date, account, page_no, pending_lme_avg.get("source_line", line), broker)
                     row["quantity"] = _num_any(pending_lme_avg.get("quantity"))
                     row["market_value"] = _num_any(pending_lme_avg.get("market_value"))
                     row["market_value_signed"] = _num_any(pending_lme_avg.get("market_value"))
@@ -2873,7 +2940,7 @@ def extract(pdf_bytes: bytes, include_open_positions: bool = True) -> Dict[str, 
             elif section == "open_positions" and include_open_positions:
                 parsed = _parse_daily_open_position_line(line, raw)
                 if parsed:
-                    row = _base_row(parsed, stmt_date, account, page_no, line)
+                    row = _base_row(parsed, stmt_date, account, page_no, line, broker)
                     row["market_value_signed"] = _signed(row.get("market_value"), row.get("drcr"))
                     # Classic daily statements print the actual card/trade id on the next line.
                     # Attach it to the position row and skip that continuation line.
@@ -2888,7 +2955,7 @@ def extract(pdf_bytes: bytes, include_open_positions: bool = True) -> Dict[str, 
                 else:
                     match = OPEN_POSITION_LINE_RE.match(line)
                     if match:
-                        row = _base_row(match.groupdict(), stmt_date, account, page_no, line)
+                        row = _base_row(match.groupdict(), stmt_date, account, page_no, line, broker)
                         row["market_value_signed"] = _signed(row.get("market_value"), row.get("drcr"))
                         if i + 1 < len(raw_lines):
                             next_line = " ".join(raw_lines[i + 1].strip().split())
@@ -3150,8 +3217,17 @@ def parse_contract_product(desc: str | None) -> dict:
 
 
     # Murex FX pair format: "USD 15,000,000.00 BRL ..." or "USD (15,000,000.00) BRL ..."
+    # Guard: first token must not be a calendar month (e.g. "JUL 26 CBT CORN" would otherwise
+    # match with ccy1=JUL, amount=26, ccy2=CBT — producing a bogus "JUL/CBT" FX product).
+    _MONTH_ABBREVS = {"JAN","FEB","MAR","APR","MAY","JUN","JUL","AUG","SEP","OCT","NOV","DEC"}
+    _EXCHANGE_ABBREVS = {"LME","SCM","BMF","CBOT","CBT","NYMEX","NYME","CME","ICE","IFUS",
+                         "MATF","MGEX","IMM","ASX","SFE","SGX","KFX","NZF","ABX","TOCOM"}
     murex_fx_m = re.match(r"^([A-Z]{3})\s+\(?[\d,.]+\)?\s+([A-Z]{3})\b", upper)
-    if murex_fx_m:
+    if (murex_fx_m
+            and murex_fx_m.group(1) not in _MONTH_ABBREVS
+            and murex_fx_m.group(2) not in _MONTH_ABBREVS
+            and murex_fx_m.group(1) not in _EXCHANGE_ABBREVS
+            and murex_fx_m.group(2) not in _EXCHANGE_ABBREVS):
         ccy1 = murex_fx_m.group(1).upper()
         ccy2 = murex_fx_m.group(2).upper()
         pair = f"{ccy1}/{ccy2}"
@@ -3615,6 +3691,7 @@ STANDARD_POSITION_COLUMNS = [
     "Trade ID",
     "Trade Date",
     "Account Number",
+    "Broker Code",
     "Net Quantity",
     "Last Update",
     "Contract Month/Year",
@@ -3649,6 +3726,7 @@ OPEN_POSITION_COLUMNS = [
     "CCY 2",
     "CCY 2 Amount",
     "Account Number",
+    "Broker Code",
     "Quantity",
     "expiryDate",
     "Contract Month/Year",
@@ -3663,6 +3741,7 @@ OPEN_POSITION_COLUMNS = [
 GROUPED_POSITION_COLUMNS = [
     "Product",
     "Type",
+    "Exchange",
     "Contract Month/Year",
     "expiryDate",
     "Trigger/Barrier",
@@ -3675,10 +3754,9 @@ GROUPED_POSITION_COLUMNS = [
     "Account Number",
     "Net Quantity",
     "Avg Fill Price",
+    "settlementPrice",
     "NOV",
     "Unrealised PNL (OTE)",
-    "Realised PNL",
-    "Day PNL",
 ]
 
 
@@ -4331,6 +4409,7 @@ def standard_position_view_from_df(df: pd.DataFrame) -> pd.DataFrame:
     settlement_price = _first_existing(out_source, ["settlementPrice", "settlement_price", "market_price", "closing_price"])
     trade_id = _first_existing(out_source, ["card", "trade_id", "global_id", "position_id"])
     account_number = _first_existing(out_source, ["account_number"])
+    broker_code = _first_existing(out_source, ["broker_code", "salesman", "Broker Code"], default=None)
     # In the StoneX OPEN POSITIONS section, the first TRADE column is the
     # trade date. It is not a contract date. Contract Date should come from
     # a true delivery/contract date when the statement provides one, such as
@@ -4404,6 +4483,7 @@ def standard_position_view_from_df(df: pd.DataFrame) -> pd.DataFrame:
         "Trade ID": trade_id,
         "Trade Date": trade_date,
         "Account Number": account_number,
+        "Broker Code": broker_code,
         "Net Quantity": net_qty,
         "Last Update": last_update,
         "Settlement Date": settlement_date,
@@ -4901,6 +4981,168 @@ def realized_pnl_summary(tables: Dict[str, pd.DataFrame]) -> pd.DataFrame:
     ]
     cols = [c for c in wanted if c in detail.columns]
     return detail[cols].copy()
+
+
+def closed_positions_standard_view(tables: Dict[str, pd.DataFrame]) -> pd.DataFrame:
+    """Normalise closed-position data to the same display-column format as
+    open_positions_standard_view.
+
+    Sources (merged):
+    - tables["Purchase & Sale"]  — individual closed trade rows (date, price, qty per leg)
+    - tables["Closed Positions"] — GROSS PROFIT OR LOSS summary rows (net realised P&L per group)
+
+    Individual P&S rows carry trade-level detail but no per-row P&L.
+    The GROSS PROFIT OR LOSS row carries the net P&L for the group.
+    Both are included so the tab shows the 3 closed trades AND the net result.
+    """
+    ps = tables.get("Purchase & Sale", pd.DataFrame())
+    closed = tables.get("Closed Positions", pd.DataFrame())
+
+    frames = []
+    if ps is not None and not ps.empty:
+        df = ps.copy()
+        df["_row_type"] = "Trade"
+        frames.append(df)
+    if closed is not None and not closed.empty:
+        df = closed.copy()
+        df["_row_type"] = "Net P&L"
+        frames.append(df)
+
+    if not frames:
+        return pd.DataFrame()
+
+    src = pd.concat(frames, ignore_index=True, sort=False)
+
+    # Fill in product metadata from contract_description where columns are absent / blank.
+    if "contract_description" in src.columns:
+        parsed = src["contract_description"].apply(
+            lambda x: pd.Series(parse_contract_product(str(x) if x else ""))
+        )
+        for col in parsed.columns:
+            if col not in src.columns or src[col].isna().all():
+                src[col] = parsed[col]
+            else:
+                missing = (
+                    src[col].isna()
+                    | (src[col].astype(str).str.strip() == "")
+                    | src[col].astype(str).str.lower().isin(["none", "other", "unknown"])
+                )
+                src[col] = src[col].where(~missing, parsed[col])
+
+    out = pd.DataFrame(index=src.index)
+    out["Product"]              = _first_existing(src, ["product", "product_name"])
+
+    # "Type" mirrors the Aggregated Positions column: Options if the row has an option_type,
+    # otherwise Futures (closed FX/swap rows show as FX via Exchange).
+    raw_option_type = _first_existing(src, ["option_type", "option_type_raw"])
+    has_option = raw_option_type.notna() & (raw_option_type.astype(str).str.strip() != "")
+    out["Type"]                 = has_option.map({True: "Options", False: "Futures"})
+
+    out["Exchange"]             = _first_existing(src, ["exchange", "Exchange"])
+    out["Contract Month/Year"]  = _first_existing(src, ["ref_month", "Contract Month/Year"])
+    if out["Contract Month/Year"].isna().all():
+        out["Contract Month/Year"] = _combine_month_year(src)
+    out["expiryDate"]           = _first_existing(src, ["close_date", "expiryDate", "expiry_date"])
+    out["Trigger/Barrier"]      = _first_existing(src, ["trigger_barrier", "Trigger/Barrier"], default=None)
+    out["CCY 1"]                = _first_existing(src, ["ccy_1", "primary_currency"], default=None)
+    out["CCY 1 Amount"]         = _first_existing(src, ["ccy_1_amount"], default=None)
+    out["CCY 2"]                = _first_existing(src, ["ccy_2", "secondary_currency"], default=None)
+    out["CCY 2 Amount"]         = _first_existing(src, ["ccy_2_amount"], default=None)
+    out["Call/Put"]             = _normalize_call_put_series(raw_option_type)
+    out["strikePrice"]          = pd.to_numeric(
+        _first_existing(src, ["strike", "strikePrice"]), errors="coerce"
+    )
+    out["Account Number"]       = _first_existing(src, ["account_number"])
+
+    # Quantity columns — Net P&L rows carry Long+Short (closed volume); Trade rows carry
+    # the individual leg quantity.  Map to the same "Net Quantity" column name as Aggregated
+    # Positions so the two views are structurally identical.
+    row_type  = src.get("_row_type", pd.Series("Trade", index=src.index))
+    trade_qty = pd.to_numeric(_first_existing(src, ["quantity"]), errors="coerce")
+    long_qty  = pd.to_numeric(_first_existing(src, ["long"]),     errors="coerce")
+    short_qty = pd.to_numeric(_first_existing(src, ["short"]),    errors="coerce")
+    is_net_row = row_type == "Net P&L"
+    # Net Quantity: for Net P&L rows show Long (total contracts closed); for Trade rows show
+    # the individual leg quantity.
+    out["Net Quantity"]         = long_qty.where(is_net_row, trade_qty)
+    # Keep Long/Short separately so users can cross-check.
+    out["Long"]                 = long_qty.where(is_net_row, None)
+    out["Short"]                = short_qty.where(is_net_row, None)
+
+    close_price = pd.to_numeric(
+        _first_existing(src, ["close_price", "trade_price", "price"]), errors="coerce"
+    )
+    out["Avg Fill Price"]       = close_price   # mirrors Aggregated Positions column name
+    out["settlementPrice"]      = close_price   # close price is the best proxy for settlement
+
+    # NOV is not applicable for closed positions — leave blank so the column exists but is empty.
+    out["NOV"]                  = None
+
+    # Realised PNL — this replaces "Unrealised PNL (OTE)" in the same visual position.
+    out["Realised PNL"]         = pd.to_numeric(
+        _first_existing(src, ["realized_pnl", "amount_signed"]), errors="coerce"
+    )
+    # Debit/Credit indicator from the statement (DR = debit / loss, CR = credit / gain).
+    out["Debit/Credit"]         = _first_existing(src, ["drcr"], default=None)
+
+    # Supplementary columns (not in GROUPED_POSITION_COLUMNS but useful for drill-down).
+    out["Contract Description"] = _first_existing(src, ["contract_description"])
+    out["Currency"]             = _first_existing(src, ["currency", "unit"])
+    out["Trade Date"]           = _first_existing(src, ["trade_date_iso", "trade_date"])
+    out["Close Date"]           = _first_existing(src, ["close_date"])
+    out["Row Type"]             = row_type
+    out["source_section"]       = _first_existing(src, ["source_section"], default="Purchase & Sale")
+
+    return _apply_conditional_position_columns(out)
+
+
+def grouped_realized_pnl_view(
+    tables: Dict[str, pd.DataFrame],
+    group_cols: list[str],
+) -> pd.DataFrame:
+    """Aggregate closed positions by the given keys, summing Realised PNL.
+
+    Uses the same column normalisation as closed_positions_standard_view and
+    applies _apply_conditional_position_columns so CCY / option visibility
+    mirrors the Aggregated Positions view.
+    """
+    df = closed_positions_standard_view(tables)
+    if df is None or df.empty:
+        return pd.DataFrame()
+
+    display_group_col_map = {
+        "product":        "Product",
+        "ref_month":      "Contract Month/Year",
+        "account_number": "Account Number",
+        "trigger_barrier":"Trigger/Barrier",
+        "option_type":    "Call/Put",
+        "strike":         "strikePrice",
+    }
+    resolved = [display_group_col_map.get(c, c) for c in group_cols]
+    available = [c for c in resolved if c in df.columns]
+    if not available:
+        available = [c for c in ["Product", "Contract Month/Year"] if c in df.columns]
+
+    # Aggregate: sum Realised PNL, Net Quantity, Long, Short.
+    # NOV / settlementPrice / Avg Fill Price use _unique_or_multiple (same as other descriptive cols).
+    numeric_sum_cols = [c for c in ["Realised PNL", "Net Quantity", "Long", "Short"] if c in df.columns]
+    agg: dict = {c: "sum" for c in numeric_sum_cols}
+    for col in df.columns:
+        if col not in available and col not in agg:
+            agg[col] = _unique_or_multiple
+
+    try:
+        grouped = df.groupby(available, dropna=False).agg(agg).reset_index()
+    except Exception:
+        return df
+
+    # Null-out Long/Short where no Net P&L rows contributed (trade-only groups).
+    for col in ["Long", "Short"]:
+        if col in grouped.columns:
+            grouped[col] = pd.to_numeric(grouped[col], errors="coerce")
+            grouped.loc[grouped[col].fillna(0) == 0, col] = None
+
+    return _apply_conditional_position_columns(grouped)
 
 
 def statement_dates_by_account(tables: Dict[str, pd.DataFrame]) -> pd.DataFrame:

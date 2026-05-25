@@ -21,8 +21,8 @@ from parser import (
     grouped_realized_pnl_view,
 )
 
-APP_VERSION_TAG = "v78"
-APP_VERSION_DESCRIPTION = "Realised PNL columns match Aggregated Positions + Debit/Credit"
+APP_VERSION_TAG = "v79"
+APP_VERSION_DESCRIPTION = "Drop trade-level noise columns from Aggregated Positions"
 
 st.set_page_config(page_title="MyStoneX Positions", layout="wide")
 st.title("MyStoneX Positions")
@@ -73,7 +73,7 @@ def _cached_extract(pdf_bytes: bytes, include_open_positions: bool):
     Keyed by the raw PDF bytes — Streamlit hashes them automatically. Returns a
     Dict[str, DataFrame] that callers must not mutate (see add_source_pdf).
 
-    Cache version: v78 (bust after closed_positions_standard_view column rename)
+    Cache version: v79 (bust after dropping noise columns from Aggregated Positions)
     """
     return extract(pdf_bytes, include_open_positions=include_open_positions)
 

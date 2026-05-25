@@ -3745,12 +3745,14 @@ GROUPED_POSITION_COLUMNS = [
     "Contract Month/Year",
     "expiryDate",
     "Trigger/Barrier",
+    "Currency",
     "CCY 1",
     "CCY 1 Amount",
     "CCY 2",
     "CCY 2 Amount",
     "Call/Put",
     "strikePrice",
+    "Delta",
     "Account Number",
     "Net Quantity",
     "Avg Fill Price",
@@ -4064,12 +4066,15 @@ def _apply_conditional_position_columns(
     if not _view_has_fx_rows(out):
         out = out.drop(columns=fx_cols, errors="ignore")
     if drop_empty_options and not _view_has_option_rows(out):
-        # Hide Call/Put and NOV when there are no option rows. Keep strikePrice when it
+        # Hide Call/Put, Delta and NOV when there are no option rows. Keep strikePrice when it
         # contains OTC accumulator/structured-product strike levels.
-        drop_cols = ["Call/Put", "NOV"]
+        drop_cols = ["Call/Put", "Delta", "NOV"]
         if "strikePrice" in out.columns and not _series_nonblank(out["strikePrice"]).any():
             drop_cols.append("strikePrice")
         out = out.drop(columns=drop_cols, errors="ignore")
+    elif "Delta" in out.columns and not _series_nonblank(out["Delta"]).any():
+        # Options present but delta not yet populated — hide until parser provides values.
+        out = out.drop(columns=["Delta"], errors="ignore")
     elif "NOV" in out.columns and not _series_nonblank(out["NOV"]).any():
         out = out.drop(columns=["NOV"], errors="ignore")
     if "Trigger/Barrier" in out.columns and not _series_nonblank(out["Trigger/Barrier"]).any():
@@ -4741,9 +4746,16 @@ def prepare_grouped_positions_display(grouped_df: pd.DataFrame, tables: Dict[str
             out["Day PNL"] = None
 
     preset = str(selected_preset or "")
-    # Trade Price, Ref Price, and Original Quantity remain detail-level Open Positions
-    # fields only; grouped views should not display them.
-    out = out.drop(columns=["Trade Price", "Ref Price", "Original Quantity"], errors="ignore")
+    # Drop all trade-level detail columns that don't belong in a grouped summary.
+    # Note: Delta is intentionally kept — it is an options-specific risk metric and belongs
+    # in the grouped view alongside Call/Put and strikePrice. It will be blank until the
+    # parser extracts delta values from the statement, but the column structure is correct.
+    out = out.drop(columns=[
+        "Trade Price", "Ref Price", "Original Quantity",
+        # These survive from STANDARD_POSITION_COLUMNS but are trade-level noise in a grouped view:
+        "Global ID", "End Date", "Trade Date",
+        "Broker Code", "Last Update", "sourceSystem",
+    ], errors="ignore")
 
     if preset in {"Product", "Product + Contract Month/Year"}:
         out = out.drop(columns=["Account Number"], errors="ignore")

@@ -19,10 +19,11 @@ from parser import (
     standard_position_view_from_df,
     closed_positions_standard_view,
     grouped_realized_pnl_view,
+    _apply_conditional_position_columns,
 )
 
-APP_VERSION_TAG = "v79"
-APP_VERSION_DESCRIPTION = "Drop trade-level noise columns from Aggregated Positions"
+APP_VERSION_TAG = "v80"
+APP_VERSION_DESCRIPTION = "All GROUPED_POSITION_COLUMNS always visible in column picker"
 
 st.set_page_config(page_title="MyStoneX Positions", layout="wide")
 st.title("MyStoneX Positions")
@@ -73,7 +74,7 @@ def _cached_extract(pdf_bytes: bytes, include_open_positions: bool):
     Keyed by the raw PDF bytes — Streamlit hashes them automatically. Returns a
     Dict[str, DataFrame] that callers must not mutate (see add_source_pdf).
 
-    Cache version: v79 (bust after dropping noise columns from Aggregated Positions)
+    Cache version: v80 (all GROUPED_POSITION_COLUMNS always present in df)
     """
     return extract(pdf_bytes, include_open_positions=include_open_positions)
 
@@ -995,9 +996,9 @@ if extracted_tables:
         st.caption("Choose an aggregation view. Filters apply before aggregation, so account/type/exchange/currency/date filters work even when those columns are hidden in the selected view.")
         grouping_presets = {
             "Product": {
-                "description": "One row per product across all accounts, contract months, expiry dates, strikes, and trade prices.",
+                "description": "One row per product and exchange, across all accounts, contract months, expiry dates, strikes, and trade prices.",
                 "mode": "custom",
-                "group_cols": ["product"],
+                "group_cols": ["product", "exchange"],
             },
             "Product + Contract Month/Year": {
                 "description": "Risk view by product and expiry/value/end date when available, otherwise contract month/year. OTC rows keep Trigger/Barrier when available; options also keep Call/Put + Strike Price.",
@@ -1041,7 +1042,34 @@ if extracted_tables:
             st.caption("No option rows detected, so Call/Put and strikePrice are hidden from position views.")
         if selected_preset in {"Product", "Product + Contract Month/Year"}:
             grouped_pos_df = grouped_pos_df.drop(columns=["Account Number"], errors="ignore")
-        grouped_default_columns = [c for c in GROUPED_POSITION_COLUMNS if c in grouped_pos_df.columns and c != "Type"]
+        # Pre-selected columns: use conditional logic to check only relevant columns by default.
+        # The picker always shows ALL GROUPED_POSITION_COLUMNS (ensured by prepare_grouped_positions_display).
+        _conditional_cols = set(_apply_conditional_position_columns(grouped_pos_df.copy()).columns)
+        # Detect what's in the data to drive smart pre-selection.
+        _grouped_has_options      = _has_option_positions(grouped_pos_df)
+        _grouped_has_accumulators = "Trigger/Barrier" in _conditional_cols  # non-blank TB → accumulator
+
+        # Product preset: Contract Month/Year and expiryDate are not grouping keys — exclude.
+        # Exception: expiryDate is kept for options (strike/expiry pair) and accumulators.
+        _preset_exclude = {"Contract Month/Year", "settlementPrice"} if selected_preset == "Product" else set()
+        if selected_preset == "Product" and not _grouped_has_options and not _grouped_has_accumulators:
+            _preset_exclude.add("expiryDate")
+
+        # expiryDate IS a grouping key for Product + Contract Month/Year and Account Grouping
+        # (replaces ref_month when available; explicit key for FX rows) — always force-include.
+        # Trigger/Barrier is a grouping key when accumulators are present — always force-include.
+        _force_include = set()
+        if selected_preset in {"Product + Contract Month/Year", "Account Grouping"}:
+            _force_include.add("expiryDate")
+        if _grouped_has_accumulators:
+            _force_include.update({"Trigger/Barrier", "expiryDate"})
+
+        grouped_default_columns = [
+            c for c in GROUPED_POSITION_COLUMNS
+            if c != "Type"
+            and c not in _preset_exclude
+            and (c in _conditional_cols or c in _force_include)
+        ]
 
         st.caption("Click a row in the Aggregated Positions table to view the trade rows that make up that group.")
         group_selection = display_custom_table(

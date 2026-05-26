@@ -3527,8 +3527,8 @@ def _fx_group_cols_for_base(group_cols: list[str] | None, mode: str = "custom") 
         return ["product", "position_type", "ccy_1", "ccy_2", "expiry_date"] + fx_option_keys
     if "account_number" in base_set:
         return ["account_number", "product", "position_type", "ccy_1", "ccy_2", "expiry_date"] + fx_option_keys
-    if base == ["product"] or base_set == {"product"}:
-        return ["product"]
+    if base_set <= {"product", "exchange"}:
+        return [c for c in ["product", "exchange"] if c in base]
     return ["product", "position_type", "ccy_1", "ccy_2", "expiry_date"] + fx_option_keys
 
 
@@ -4072,9 +4072,6 @@ def _apply_conditional_position_columns(
         if "strikePrice" in out.columns and not _series_nonblank(out["strikePrice"]).any():
             drop_cols.append("strikePrice")
         out = out.drop(columns=drop_cols, errors="ignore")
-    elif "Delta" in out.columns and not _series_nonblank(out["Delta"]).any():
-        # Options present but delta not yet populated — hide until parser provides values.
-        out = out.drop(columns=["Delta"], errors="ignore")
     elif "NOV" in out.columns and not _series_nonblank(out["NOV"]).any():
         out = out.drop(columns=["NOV"], errors="ignore")
     if "Trigger/Barrier" in out.columns and not _series_nonblank(out["Trigger/Barrier"]).any():
@@ -4558,16 +4555,15 @@ def _add_grouped_risk_pnl_columns(df: pd.DataFrame, grouped_raw: pd.DataFrame | 
 
     - NOV is populated with option OTE only.
     - Unrealised PNL (OTE) is populated with non-option OTE only.
-    - Realised PNL and Day PNL are included for every grouped view; they remain blank
-      unless a future parser enhancement maps daily/realized P&L rows into group keys.
+    Realised PNL and Day PNL are intentionally excluded — they live in the
+    dedicated Realised PNL tab, not in position views.
     """
     if df is None:
         df = pd.DataFrame()
     out = df.copy()
     if out.empty:
-        for col in ["NOV", "Realised PNL", "Day PNL"]:
-            if col not in out.columns:
-                out[col] = pd.Series(dtype=float)
+        if "NOV" not in out.columns:
+            out["NOV"] = pd.Series(dtype=float)
         return out
 
     raw = grouped_raw if grouped_raw is not None else pd.DataFrame(index=out.index)
@@ -4606,10 +4602,6 @@ def _add_grouped_risk_pnl_columns(df: pd.DataFrame, grouped_raw: pd.DataFrame | 
         out["NOV"] = existing_ote.where(is_option, None)
         out["Unrealised PNL (OTE)"] = existing_ote.where(~is_option, None)
 
-    if "Realised PNL" not in out.columns:
-        out["Realised PNL"] = None
-    if "Day PNL" not in out.columns:
-        out["Day PNL"] = None
     return out
 
 
@@ -4625,10 +4617,6 @@ def _apply_grouped_nov_ote_display_rules(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
     if "NOV" not in out.columns:
         out["NOV"] = None
-    if "Realised PNL" not in out.columns:
-        out["Realised PNL"] = None
-    if "Day PNL" not in out.columns:
-        out["Day PNL"] = None
     if "Unrealised PNL (OTE)" not in out.columns:
         out["Unrealised PNL (OTE)"] = None
 
@@ -4678,50 +4666,15 @@ def _standardized_realized_pnl_for_grouping(tables: Dict[str, pd.DataFrame]) -> 
 
 
 def add_grouped_position_pnl_columns(grouped_df: pd.DataFrame, tables: Dict[str, pd.DataFrame], selected_preset: str | None = None) -> pd.DataFrame:
-    """Add Realised PNL and Day PNL columns to a grouped-position view.
+    """Apply NOV/OTE display rules to a grouped-position view.
 
-    Realised PNL is joined from closed/P&S detail where the source has enough product/month/account
-    metadata. Day PNL is included for layout consistency and is left blank unless a future parser
-    provides row-level day_pnl.
+    Realised PNL and Day PNL are no longer shown in position views — they have a
+    dedicated Realised PNL tab.
     """
     if grouped_df is None or grouped_df.empty:
         return grouped_df
     out = grouped_df.copy()
     out = _apply_grouped_nov_ote_display_rules(out)
-    out["Realised PNL"] = None
-    out["Day PNL"] = None
-
-    pnl = _standardized_realized_pnl_for_grouping(tables)
-    if pnl is None or pnl.empty:
-        return out
-
-    preset = str(selected_preset or "")
-    if preset == "Product":
-        keys = ["Product"]
-    elif preset == "Account Grouping":
-        keys = ["Account Number", "Product", "Contract Month/Year", "Call/Put", "strikePrice"]
-    else:
-        keys = ["Product", "Contract Month/Year", "Call/Put", "strikePrice"]
-
-    keys = [k for k in keys if k in out.columns and k in pnl.columns]
-    if not keys:
-        return out
-
-    def norm_frame(df: pd.DataFrame, columns: list[str]) -> pd.DataFrame:
-        temp = df.copy()
-        for col in columns:
-            if col == "strikePrice":
-                temp[col] = pd.to_numeric(temp[col], errors="coerce")
-            else:
-                temp[col] = temp[col].astype(str).str.strip().str.upper()
-                temp.loc[temp[col].isin(["", "NONE", "NAN", "NAT", "OTHER", "UNKNOWN", "MULTIPLE"]), col] = ""
-        return temp
-
-    left = norm_frame(out, keys)
-    right = norm_frame(pnl, keys)
-    pnl_agg = right.groupby(keys, dropna=False)["Realised PNL"].sum().reset_index()
-    left = left.drop(columns=["Realised PNL"], errors="ignore").merge(pnl_agg, on=keys, how="left")
-    out["Realised PNL"] = left["Realised PNL"].values
     return out
 
 
@@ -4737,13 +4690,7 @@ def prepare_grouped_positions_display(grouped_df: pd.DataFrame, tables: Dict[str
         return grouped_df
     out = grouped_df.copy()
     out = _apply_grouped_nov_ote_display_rules(out)
-    if tables is not None:
-        out = add_grouped_position_pnl_columns(out, tables, selected_preset)
-    else:
-        if "Realised PNL" not in out.columns:
-            out["Realised PNL"] = None
-        if "Day PNL" not in out.columns:
-            out["Day PNL"] = None
+    out = _apply_grouped_nov_ote_display_rules(out)
 
     preset = str(selected_preset or "")
     # Drop all trade-level detail columns that don't belong in a grouped summary.
@@ -4778,6 +4725,16 @@ def prepare_grouped_positions_display(grouped_df: pd.DataFrame, tables: Dict[str
         # and strikePrice were removed for display.
         out = out.drop(columns=["Call/Put", "strikePrice"], errors="ignore")
     out = _apply_conditional_position_columns(out, drop_empty_options=not drop_option_columns)
+    # Ensure every column in GROUPED_POSITION_COLUMNS is always present in the
+    # dataframe so the customise-columns picker shows the full list regardless of
+    # whether FX / option / blank-expiry logic conditionally removed them above.
+    # Columns that were dropped by _apply_conditional_position_columns are re-added
+    # as empty (None) columns — they will not be pre-selected by default but remain
+    # available for the user to toggle on.
+    for col in GROUPED_POSITION_COLUMNS:
+        if col not in out.columns:
+            out[col] = None
+
     ordered = [c for c in GROUPED_POSITION_COLUMNS if c in out.columns]
     ordered += [c for c in out.columns if c not in ordered]
     return out[ordered]

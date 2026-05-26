@@ -2181,6 +2181,493 @@ def _is_card_continuation_line(line: str) -> bool:
 
 
 
+def looks_like_asx_statement(pdf_bytes: bytes) -> bool:
+    """Detect ASX/SFE-format statements from StoneX Financial Pty Ltd (Australian entity).
+
+    These PDFs use the same stacked-text table layout as IFL statements but come from the
+    Australian subsidiary and contain FUTURES / OPTIONS CONFIRMATIONS, OPEN POSITIONS, and
+    PURCHASE & SALE sections identified by 'Diagnostic Key:' headers.
+    """
+    try:
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        text = "\n".join(page.get_text("text") for page in list(doc)[:4])
+        return (
+            "StoneX Financial Pty Ltd" in text
+            and (
+                "FUTURES / OPTIONS OPEN POSITIONS" in text
+                or "FUTURES / OPTIONS CONFIRMATIONS" in text
+                or "PURCHASE & SALE" in text
+            )
+        )
+    except Exception:
+        return False
+
+
+def _parse_asx_trade_rows(
+    lines: list[str],
+    stmt_date: str | None,
+    account: str | None,
+    page_no: int,
+    source_section: str = "Executed Trades",
+) -> list[dict]:
+    """Parse ASX FUTURES / OPTIONS CONFIRMATIONS rows (stacked PyMuPDF format).
+
+    Rows have the structure:
+      DD-Mon-YYYY          ← trade date
+      <qty>                ← buy qty (alone on line = Buy side)
+      Mon-YY EXCHANGE PRODUCT  ← delivery / product
+      [Call|Put]           ← optional C/P
+      [strike]             ← optional strike
+      <trade_price>
+      [BROKER_CODE]        ← e.g. SYSFA, SYMER  (optional)
+      [CCY]                ← optional; futures often omit amount
+      [amount]             ← optional (present for options premium)
+
+    Sell rows have qty + delivery on the same line:
+      DD-Mon-YYYY
+      <qty> Mon-YY EXCHANGE PRODUCT
+      ...
+    """
+    rows: list[dict] = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        if not _is_dd_mmm_yyyy(line):
+            i += 1
+            continue
+        if i + 2 >= len(lines):
+            break
+
+        nxt = lines[i + 1]
+        buy_qty = sell_qty = None
+        delivery_product = None
+        j = i + 2
+
+        if re.match(r"^[\d,]+$", nxt):
+            buy_qty = _num_any(nxt)
+            delivery_product = lines[i + 2] if i + 2 < len(lines) else None
+            j = i + 3
+        else:
+            m_sell = re.match(r"^(?P<qty>[\d,]+)\s+(?P<dp>.+)$", nxt)
+            if m_sell:
+                sell_qty = _num_any(m_sell.group("qty"))
+                delivery_product = m_sell.group("dp")
+                j = i + 2
+            else:
+                i += 1
+                continue
+
+        if not delivery_product or not re.match(
+            r"^(?:\d{1,2}-[A-Za-z]{3}-\d{2,4}|[A-Za-z]{3}-\d{2,4})\s+", delivery_product
+        ):
+            i += 1
+            continue
+
+        # Optional Call/Put + Strike
+        call_put = strike = None
+        if j < len(lines) and str(lines[j]).strip().upper() in {"C", "P", "CALL", "PUT"}:
+            call_put = str(lines[j]).strip().upper()
+            if j + 1 < len(lines):
+                strike = _num_any(lines[j + 1])
+            j += 2
+
+        if j >= len(lines):
+            i += 1
+            continue
+        trade_price = _num_any(lines[j])
+        if trade_price is None:
+            i += 1
+            continue
+        j += 1
+
+        # Scan forward for optional broker code, ccy, amount
+        broker_code = ccy = amount = None
+        k = j
+        while k < len(lines) and k < j + 5:
+            token = str(lines[k]).strip()
+            if not token:
+                k += 1
+                continue
+            if _is_dd_mmm_yyyy(token) or token.startswith("Diagnostic Key:") or re.match(r"^Total[:\s]", token) or token == "Total":
+                break
+            if _is_ccy_line(token):
+                ccy = token
+                k += 1
+                if k < len(lines):
+                    amt = _num_any(lines[k])
+                    if amt is not None:
+                        amount = amt
+                        k += 1
+                break
+            # Non-numeric text → broker code
+            if not _is_amount_line(token) and _num_any(token) is None:
+                broker_code = token
+            k += 1
+
+        delivery_parts = _parse_delivery_product_text(delivery_product)
+        desc = delivery_parts.get("contract_description")
+        parsed_meta = parse_contract_product(desc)
+        option_type = None
+        if call_put in {"C", "CALL"}:
+            option_type = "Call"
+        elif call_put in {"P", "PUT"}:
+            option_type = "Put"
+        elif parsed_meta.get("option_type"):
+            option_type = parsed_meta.get("option_type")
+        if strike is None:
+            strike = parsed_meta.get("strike")
+
+        qty_abs = buy_qty if buy_qty is not None else sell_qty
+        row = {
+            "trade_date": line,
+            "trade_date_iso": _normalize_any_date(line, stmt_date),
+            "quantity": qty_abs,
+            "buy": buy_qty,
+            "sell": sell_qty,
+            "side": "Buy" if buy_qty is not None else "Sell",
+            "delivery_date": delivery_parts.get("delivery_date"),
+            "contract_date": delivery_parts.get("contract_date"),
+            "settlement_date": delivery_parts.get("contract_date"),
+            "contract_month": delivery_parts.get("contract_month"),
+            "contract_year": delivery_parts.get("contract_year"),
+            "ref_month": delivery_parts.get("ref_month"),
+            "contract_description": desc,
+            "exchange": parsed_meta.get("exchange"),
+            "product": parsed_meta.get("product"),
+            "option_type": option_type,
+            "option_type_raw": call_put,
+            "strike": strike,
+            "trade_price": trade_price,
+            "price": trade_price,
+            "currency": ccy,
+            "amount": amount,
+            "broker_code": broker_code,
+            "statement_date": stmt_date,
+            "account_number": account,
+            "page": page_no,
+            "source_section": source_section,
+            "source_system": broker_code or "StoneX",
+            "source_line": " ".join(str(x) for x in lines[i:k]),
+        }
+        rows.append(row)
+        i = k
+    return rows
+
+
+def _scan_asx_ps_total(lines: list[str], start_idx: int) -> tuple[float | None, float | None, str | None, float | None, int]:
+    """Scan from a 'Total' line to extract buy_qty, sell_qty, ccy, realized_pnl.
+
+    Handles both single-line totals:
+        "Total 163 163 P&S AUD 12,925.00"
+    and stacked (PyMuPDF emits each token on its own line):
+        Total / 163 / 163 / P&S / AUD / 12,925.00
+
+    Also handles option totals:
+        "Total: 10 Premium Paid AUD 0.00"
+
+    Returns (buy_qty, sell_qty, ccy, amount, next_index).
+    """
+    # Join the next few lines to handle both single and stacked layouts
+    chunk = " ".join(str(lines[j]).strip() for j in range(start_idx, min(start_idx + 8, len(lines))))
+    # Pattern A: "Total [qty] [qty] P&S CCY amount"
+    m = re.search(
+        r"Total:?\s+([\d,]+)\s+([\d,]+)\s+(?:P&S)\s+([A-Z]{3})\s+([\d,]+(?:\.\d+)?)",
+        chunk,
+    )
+    # Pattern B: "Total: [qty] Premium Paid CCY amount"
+    if not m:
+        m = re.search(
+            r"Total:?\s+([\d,]+)\s+(?:Premium\s+Paid|P&S)\s+([A-Z]{3})\s+([\d,]+(?:\.\d+)?)",
+            chunk,
+        )
+        if m:
+            buy_qty = _num_any(m.group(1))
+            ccy = m.group(2)
+            amount = _num_any(m.group(3))
+            # Advance index past the consumed tokens
+            end_k = start_idx + 1
+            while end_k < len(lines) and end_k < start_idx + 8:
+                if _num_any(lines[end_k]) == amount and amount is not None:
+                    end_k += 1
+                    break
+                end_k += 1
+            return buy_qty, buy_qty, ccy, amount, end_k
+    if m:
+        buy_qty = _num_any(m.group(1))
+        sell_qty = _num_any(m.group(2))
+        ccy = m.group(3)
+        amount = _num_any(m.group(4))
+        # Advance past consumed tokens
+        end_k = start_idx + 1
+        target = m.group(4)
+        for j in range(start_idx + 1, min(start_idx + 8, len(lines))):
+            if str(lines[j]).strip().replace(",", "") == target.replace(",", ""):
+                end_k = j + 1
+                break
+        return buy_qty, sell_qty, ccy, amount, end_k
+    return None, None, None, None, start_idx + 1
+
+
+def _parse_asx_ps_rows(
+    lines: list[str],
+    stmt_date: str | None,
+    account: str | None,
+    page_no: int,
+) -> tuple[list[dict], list[dict]]:
+    """Parse ASX PURCHASE & SALE section.
+
+    Returns (trade_rows, closed_position_rows).
+    - trade_rows: individual buy/sell records (no P&L, just the raw trades)
+    - closed_position_rows: one row per product group with realized P&L, from Total lines
+    """
+    trades: list[dict] = []
+    closed: list[dict] = []
+    i = 0
+    last_contract: dict = {}   # most recently parsed trade row (for product context on Total)
+
+    while i < len(lines):
+        line = lines[i]
+
+        # Detect Total line: "Total" or "Total:" or "Total 163 ..."
+        if re.match(r"^Total[:\s]", line) or line.strip() == "Total":
+            buy_qty, sell_qty, ccy, amount, next_i = _scan_asx_ps_total(lines, i)
+            if amount is not None and last_contract:
+                amount_signed = amount if (buy_qty or 0) >= (sell_qty or 0) else -amount
+                # Treat DR amounts as negative: look for DR marker in next few lines
+                for peek in range(i, min(next_i + 2, len(lines))):
+                    if "DR" in str(lines[peek]).upper():
+                        amount_signed = -abs(amount)
+                        break
+                row = {
+                    "trade_date": last_contract.get("trade_date"),
+                    "trade_date_iso": last_contract.get("trade_date_iso"),
+                    "statement_date": stmt_date,
+                    "account_number": account,
+                    "contract_description": last_contract.get("contract_description"),
+                    "exchange": last_contract.get("exchange"),
+                    "product": last_contract.get("product"),
+                    "ref_month": last_contract.get("ref_month"),
+                    "contract_month": last_contract.get("contract_month"),
+                    "contract_year": last_contract.get("contract_year"),
+                    "option_type": last_contract.get("option_type"),
+                    "strike": last_contract.get("strike"),
+                    "quantity": sell_qty or buy_qty,
+                    "buy": buy_qty,
+                    "sell": sell_qty,
+                    "currency": ccy,
+                    "realized_pnl": amount_signed,
+                    "amount_signed": amount_signed,
+                    "pnl_view": "Closed Position Detail",
+                    "source_section": "Purchase & Sale",
+                    "source_system": "StoneX",
+                    "page": page_no,
+                }
+                closed.append(row)
+            i = next_i
+            continue
+
+        if not _is_dd_mmm_yyyy(line):
+            i += 1
+            continue
+        if i + 2 >= len(lines):
+            break
+
+        nxt = lines[i + 1]
+        buy_qty_t = sell_qty_t = None
+        delivery_product = None
+        j = i + 2
+
+        if re.match(r"^[\d,]+$", nxt):
+            buy_qty_t = _num_any(nxt)
+            delivery_product = lines[i + 2] if i + 2 < len(lines) else None
+            j = i + 3
+        else:
+            m_sell = re.match(r"^(?P<qty>[\d,]+)\s+(?P<dp>.+)$", nxt)
+            if m_sell:
+                sell_qty_t = _num_any(m_sell.group("qty"))
+                delivery_product = m_sell.group("dp")
+                j = i + 2
+            else:
+                i += 1
+                continue
+
+        if not delivery_product or not re.match(
+            r"^(?:\d{1,2}-[A-Za-z]{3}-\d{2,4}|[A-Za-z]{3}-\d{2,4})\s+", delivery_product
+        ):
+            i += 1
+            continue
+
+        call_put = strike_t = None
+        if j < len(lines) and str(lines[j]).strip().upper() in {"C", "P", "CALL", "PUT"}:
+            call_put = str(lines[j]).strip().upper()
+            if j + 1 < len(lines):
+                strike_t = _num_any(lines[j + 1])
+            j += 2
+
+        if j >= len(lines):
+            i += 1
+            continue
+        trade_price = _num_any(lines[j])
+        if trade_price is None:
+            i += 1
+            continue
+        j += 1
+
+        broker_code = ccy_t = amount_t = None
+        k = j
+        while k < len(lines) and k < j + 5:
+            token = str(lines[k]).strip()
+            if not token:
+                k += 1
+                continue
+            if _is_dd_mmm_yyyy(token) or token.startswith("Diagnostic Key:") or re.match(r"^Total[:\s]", token) or token == "Total":
+                break
+            if _is_ccy_line(token):
+                ccy_t = token
+                k += 1
+                if k < len(lines):
+                    amt = _num_any(lines[k])
+                    if amt is not None:
+                        amount_t = amt
+                        k += 1
+                break
+            if not _is_amount_line(token) and _num_any(token) is None:
+                broker_code = token
+            k += 1
+
+        delivery_parts = _parse_delivery_product_text(delivery_product)
+        desc = delivery_parts.get("contract_description")
+        parsed_meta = parse_contract_product(desc)
+        option_type = None
+        if call_put in {"C", "CALL"}:
+            option_type = "Call"
+        elif call_put in {"P", "PUT"}:
+            option_type = "Put"
+        elif parsed_meta.get("option_type"):
+            option_type = parsed_meta.get("option_type")
+        if strike_t is None:
+            strike_t = parsed_meta.get("strike")
+
+        qty_abs = buy_qty_t if buy_qty_t is not None else sell_qty_t
+        row = {
+            "trade_date": line,
+            "trade_date_iso": _normalize_any_date(line, stmt_date),
+            "quantity": qty_abs,
+            "buy": buy_qty_t,
+            "sell": sell_qty_t,
+            "side": "Buy" if buy_qty_t is not None else "Sell",
+            "delivery_date": delivery_parts.get("delivery_date"),
+            "contract_date": delivery_parts.get("contract_date"),
+            "settlement_date": delivery_parts.get("contract_date"),
+            "contract_month": delivery_parts.get("contract_month"),
+            "contract_year": delivery_parts.get("contract_year"),
+            "ref_month": delivery_parts.get("ref_month"),
+            "contract_description": desc,
+            "exchange": parsed_meta.get("exchange"),
+            "product": parsed_meta.get("product"),
+            "option_type": option_type,
+            "option_type_raw": call_put,
+            "strike": strike_t,
+            "trade_price": trade_price,
+            "price": trade_price,
+            "currency": ccy_t,
+            "amount": amount_t,
+            "broker_code": broker_code,
+            "statement_date": stmt_date,
+            "account_number": account,
+            "page": page_no,
+            "source_section": "Purchase & Sale",
+            "source_system": broker_code or "StoneX",
+            "source_line": " ".join(str(x) for x in lines[i:k]),
+        }
+        trades.append(row)
+        last_contract = row
+        i = k
+    return trades, closed
+
+
+def extract_asx_statement(pdf_bytes: bytes, include_open_positions: bool = True) -> Dict[str, pd.DataFrame]:
+    """Parse StoneX Financial Pty Ltd ASX/SFE statements.
+
+    Same stacked-text table layout as IFL statements. Sections are delimited by
+    'Diagnostic Key:' lines.  Parses:
+      - FUTURES / OPTIONS OPEN POSITIONS  → Open Positions
+      - FUTURES / OPTIONS CONFIRMATIONS   → Executed Trades
+      - PURCHASE & SALE                   → Purchase & Sale (trade detail) + Closed Positions (P&L totals)
+    """
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    open_positions: list[dict] = []
+    executed_trades: list[dict] = []
+    purchase_sale: list[dict] = []
+    closed_positions: list[dict] = []
+
+    for page_no, page in enumerate(doc, start=1):
+        text = page.get_text("text")
+        stmt_date, account = _ifl_page_header_info(text)
+        raw_lines = [" ".join(x.strip().split()) for x in text.splitlines() if x.strip()]
+
+        lines_by_section: dict[str, list[str]] = {}
+        section: str | None = None
+
+        for line in raw_lines:
+            if line == "FUTURES / OPTIONS OPEN POSITIONS":
+                section = "open"
+                lines_by_section.setdefault(section, [])
+                continue
+            if line == "FUTURES / OPTIONS CONFIRMATIONS":
+                section = "confirmations"
+                lines_by_section.setdefault(section, [])
+                continue
+            if line == "PURCHASE & SALE":
+                section = "ps"
+                lines_by_section.setdefault(section, [])
+                continue
+            if line.startswith("Diagnostic Key:") or line in {
+                "RECAP OF CONFIRMATION ACTIVITY",
+                "FINANCIAL SUMMARY",
+                "PURCHASE & SALE_Total",
+                "Disclaimers",
+            }:
+                section = None
+                continue
+            if section:
+                lines_by_section.setdefault(section, []).append(line)
+
+        if include_open_positions and "open" in lines_by_section:
+            open_positions.extend(
+                _parse_ifl_futures_options_rows(lines_by_section["open"], stmt_date, account, page_no)
+            )
+        if "confirmations" in lines_by_section:
+            executed_trades.extend(
+                _parse_asx_trade_rows(
+                    lines_by_section["confirmations"], stmt_date, account, page_no,
+                    source_section="Executed Trades",
+                )
+            )
+        if "ps" in lines_by_section:
+            ps_trades, ps_closed = _parse_asx_ps_rows(
+                lines_by_section["ps"], stmt_date, account, page_no
+            )
+            purchase_sale.extend(ps_trades)
+            closed_positions.extend(ps_closed)
+
+    tables: Dict[str, pd.DataFrame] = {
+        "Executed Trades": pd.DataFrame(executed_trades),
+        "Purchase & Sale": pd.DataFrame(purchase_sale),
+        "Receives Delivers": pd.DataFrame(),
+        "Journal Entries": pd.DataFrame(),
+        "Realized Gain and Loss": pd.DataFrame(),
+        "Closed Positions": pd.DataFrame(closed_positions),
+        "Realized PNL Summary": pd.DataFrame(),
+        "Open Positions": pd.DataFrame(open_positions),
+        "Notes": pd.DataFrame(),
+        "Exceptions": pd.DataFrame(),
+    }
+    tables = enrich_open_positions_metadata(tables)
+    tables["Summary"] = build_summary(tables)
+    return tables
+
+
 def looks_like_ifl_statement(pdf_bytes: bytes) -> bool:
     """Detect StoneX Financial Ltd IFL statements with line-stacked open-position tables."""
     try:
@@ -2749,6 +3236,8 @@ def extract_ifl_statement(pdf_bytes: bytes, include_open_positions: bool = True)
     return tables
 
 def extract(pdf_bytes: bytes, include_open_positions: bool = True) -> Dict[str, pd.DataFrame]:
+    if looks_like_asx_statement(pdf_bytes):
+        return extract_asx_statement(pdf_bytes, include_open_positions=include_open_positions)
     if looks_like_ifl_statement(pdf_bytes):
         return extract_ifl_statement(pdf_bytes, include_open_positions=include_open_positions)
     if looks_like_murex_statement(pdf_bytes):
@@ -4915,7 +5404,8 @@ def realized_pnl_summary(tables: Dict[str, pd.DataFrame]) -> pd.DataFrame:
         if "amount_signed" in df.columns:
             df["realized_pnl"] = df["amount_signed"].apply(_num_any)
         elif "amount" in df.columns:
-            df["realized_pnl"] = [_signed(a, d) for a, d in zip(df.get("amount"), df.get("drcr"))]
+            drcr_series = df["drcr"] if "drcr" in df.columns else [None] * len(df)
+            df["realized_pnl"] = [_signed(a, d) for a, d in zip(df["amount"], drcr_series)]
         # Raw P&S rows are useful audit detail but are not the closed-position total rows.
         df["pnl_view"] = "P&S Trade Detail"
         frames.append(df)

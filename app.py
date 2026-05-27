@@ -19,11 +19,12 @@ from parser import (
     standard_position_view_from_df,
     closed_positions_standard_view,
     grouped_realized_pnl_view,
+    grouped_fx_trades_view,
     _apply_conditional_position_columns,
 )
 
-APP_VERSION_TAG = "v80"
-APP_VERSION_DESCRIPTION = "All GROUPED_POSITION_COLUMNS always visible in column picker"
+APP_VERSION_TAG = "v93"
+APP_VERSION_DESCRIPTION = "Drop CCY columns from Aggregated Positions in all views, not just FX"
 
 st.set_page_config(page_title="MyStoneX Positions", layout="wide")
 st.title("MyStoneX Positions")
@@ -74,7 +75,7 @@ def _cached_extract(pdf_bytes: bytes, include_open_positions: bool):
     Keyed by the raw PDF bytes — Streamlit hashes them automatically. Returns a
     Dict[str, DataFrame] that callers must not mutate (see add_source_pdf).
 
-    Cache version: v80 (all GROUPED_POSITION_COLUMNS always present in df)
+    Cache version: v93 (Drop CCY columns from all Aggregated Positions views)
     """
     return extract(pdf_bytes, include_open_positions=include_open_positions)
 
@@ -430,11 +431,14 @@ def _clean_filter_values(series):
 
 
 def _render_position_search_controls(base_view_df, key_prefix):
-    """Render account/product/type/exchange/currency/date filters for Trades and Aggregated Positions."""
+    """Render account/product/type/exchange/currency/date filters for Trades and Aggregated Positions.
+
+    Exchange renders before Product so selecting an exchange dynamically narrows the product list.
+    """
     filters = {
         "account": "",
         "broker": "",
-        "product": "",
+        "products": [],
         "types": [],
         "exchanges": [],
         "currencies": [],
@@ -447,8 +451,11 @@ def _render_position_search_controls(base_view_df, key_prefix):
         return filters
 
     key_prefix_safe = _safe_key(key_prefix)
+    exchange_key = f"{key_prefix_safe}_exchange_filter_{APP_VERSION_TAG}"
+
     with st.container(border=True):
         st.caption("Filters")
+        # Row 1: Account | Exchange | Type  (Exchange first so product list can react to it)
         r1c1, r1c2, r1c3 = st.columns(3)
         filters["account"] = r1c1.text_input(
             "Account Number contains",
@@ -456,12 +463,13 @@ def _render_position_search_controls(base_view_df, key_prefix):
             key=f"{key_prefix_safe}_account_search_{APP_VERSION_TAG}",
             placeholder="e.g. LME11630",
         )
-        filters["product"] = r1c2.text_input(
-            "Product contains",
-            value="",
-            key=f"{key_prefix_safe}_product_search_{APP_VERSION_TAG}",
-            placeholder="e.g. Coffee, Copper, AUD/USD",
-        )
+        exchange_options = _clean_filter_values(base_view_df["Exchange"]) if "Exchange" in base_view_df.columns else []
+        filters["exchanges"] = r1c2.multiselect(
+            "Exchange",
+            options=exchange_options,
+            key=exchange_key,
+        ) if exchange_options else []
+
         type_options = _clean_filter_values(base_view_df["Type"]) if "Type" in base_view_df.columns else []
         filters["types"] = r1c3.multiselect(
             "Type",
@@ -469,13 +477,25 @@ def _render_position_search_controls(base_view_df, key_prefix):
             key=f"{key_prefix_safe}_type_filter_{APP_VERSION_TAG}",
         ) if type_options else []
 
+        # Row 2: Product (filtered by selected exchanges) | Currency | Date
         r2c1, r2c2, r2c3 = st.columns(3)
-        exchange_options = _clean_filter_values(base_view_df["Exchange"]) if "Exchange" in base_view_df.columns else []
-        filters["exchanges"] = r2c1.multiselect(
-            "Exchange",
-            options=exchange_options,
-            key=f"{key_prefix_safe}_exchange_filter_{APP_VERSION_TAG}",
-        ) if exchange_options else []
+
+        # Narrow the product list to exchanges already selected (reads session_state from the
+        # widget rendered above — updated on every Streamlit rerun).
+        selected_exchanges_now = st.session_state.get(exchange_key) or []
+        if selected_exchanges_now and "Exchange" in base_view_df.columns:
+            wanted_ex = {str(x).strip().upper() for x in selected_exchanges_now}
+            product_source_df = base_view_df[
+                base_view_df["Exchange"].astype(str).str.strip().str.upper().isin(wanted_ex)
+            ]
+        else:
+            product_source_df = base_view_df
+        product_options = _clean_filter_values(product_source_df["Product"]) if "Product" in product_source_df.columns else []
+        filters["products"] = r2c1.multiselect(
+            "Product",
+            options=product_options,
+            key=f"{key_prefix_safe}_product_filter_{APP_VERSION_TAG}",
+        ) if product_options else []
 
         currency_values = []
         for ccy_col in ["Currency", "CCY 1", "CCY 2"]:
@@ -523,9 +543,10 @@ def _position_filter_mask(view_df, filters):
     if broker_q and "Broker Code" in view_df.columns:
         mask &= view_df["Broker Code"].astype(str).str.contains(broker_q, case=False, na=False, regex=False)
 
-    product_q = str(filters.get("product") or "").strip()
-    if product_q and "Product" in view_df.columns:
-        mask &= view_df["Product"].astype(str).str.contains(product_q, case=False, na=False, regex=False)
+    selected_products = filters.get("products") or []
+    if selected_products and "Product" in view_df.columns:
+        wanted = {str(x).strip().upper() for x in selected_products}
+        mask &= view_df["Product"].astype(str).str.strip().str.upper().isin(wanted)
 
     selected_types = filters.get("types") or []
     if selected_types and "Type" in view_df.columns:
@@ -573,7 +594,7 @@ def _apply_position_filters_to_tables(tables, filters):
     has_filter = bool(
         str(filters.get("account") or "").strip()
         or str(filters.get("broker") or "").strip()
-        or str(filters.get("product") or "").strip()
+        or filters.get("products")
         or filters.get("types")
         or filters.get("exchanges")
         or filters.get("currencies")
@@ -597,7 +618,7 @@ def _apply_position_filters_to_tables(tables, filters):
 def _safe_key(text):
     return "".join(ch if ch.isalnum() else "_" for ch in str(text))
 
-def display_custom_table(label, df, default_columns=None, default_only=False, selectable=False, selection_key=None, table_key_override=None):
+def display_custom_table(label, df, default_columns=None, default_only=False, selectable=False, selection_key=None, table_key_override=None, multi_select=False, height=None):
     df = clean_for_display(df)
     if df.empty:
         st.dataframe(df, use_container_width=True)
@@ -665,13 +686,15 @@ def display_custom_table(label, df, default_columns=None, default_only=False, se
         # Streamlit dataframe row selection powers the aggregated-position drill-down.
         # Selection row indexes refer to the displayed dataframe, which is built from df
         # without reordering, so they can be used to fetch the selected source row.
-        return st.dataframe(
-            display_df,
+        kwargs = dict(
             use_container_width=True,
             on_select="rerun",
-            selection_mode="single-row",
+            selection_mode="multi-row" if multi_select else "single-row",
             key=selection_key or f"df_select_{table_key}",
         )
+        if height is not None:
+            kwargs["height"] = height
+        return st.dataframe(display_df, **kwargs)
 
     def _quantity_color(value):
         try:
@@ -684,12 +707,13 @@ def display_custom_table(label, df, default_columns=None, default_only=False, se
             return "color: green; font-weight: 600"
         return ""
 
+    height_kwargs = {"height": height} if height is not None else {}
     quantity_cols = [c for c in ["Quantity", "Net Quantity"] if c in display_df.columns]
     if quantity_cols:
         styled = display_df.style.map(_quantity_color, subset=quantity_cols)
-        st.dataframe(styled, use_container_width=True)
+        st.dataframe(styled, use_container_width=True, **height_kwargs)
     else:
-        st.dataframe(display_df, use_container_width=True)
+        st.dataframe(display_df, use_container_width=True, **height_kwargs)
     return None
 
 
@@ -1055,6 +1079,25 @@ if extracted_tables:
         if selected_preset == "Product" and not _grouped_has_options and not _grouped_has_accumulators:
             _preset_exclude.add("expiryDate")
 
+        # CCY 1/2 and their amounts are removed from the Aggregated Positions table
+        # in all views — they are trade-level FX detail and not useful in a grouped
+        # summary regardless of whether the view is purely FX or mixed.
+        grouped_pos_df = grouped_pos_df.drop(
+            columns=["CCY 1", "CCY 1 Amount", "CCY 2", "CCY 2 Amount"],
+            errors="ignore",
+        )
+        _preset_exclude.update({"CCY 1", "CCY 1 Amount", "CCY 2", "CCY 2 Amount"})
+
+        # For purely FX views also hide Exchange and Currency from defaults.
+        if "Type" in grouped_pos_df.columns:
+            _type_vals = grouped_pos_df["Type"].dropna().astype(str).str.strip().str.upper()
+            _type_vals = _type_vals[_type_vals.str.lower().ne("multiple") & _type_vals.ne("")]
+            _all_fx = _type_vals.str.startswith("FX").all() | _type_vals.isin(["NDO"]).all() if not _type_vals.empty else False
+        else:
+            _all_fx = False
+        if _all_fx:
+            _preset_exclude.update({"Exchange", "Currency"})
+
         # expiryDate IS a grouping key for Product + Contract Month/Year and Account Grouping
         # (replaces ref_month when available; explicit key for FX rows) — always force-include.
         # Trigger/Barrier is a grouping key when accumulators are present — always force-include.
@@ -1122,14 +1165,119 @@ if extracted_tables:
         trades_has_option_positions = _has_option_positions(trades_filtered_df)
         trades_view_df = _drop_option_columns_when_no_options(trades_filtered_df, trades_has_option_positions)
         latest_trades_df = trades_view_df.copy()
-        display_custom_table(
-            "Trades",
-            trades_view_df,
-            default_columns=_open_positions_default_columns(trades_view_df),
-            default_only=True,
-            table_key_override=f"Trades {APP_VERSION_TAG}",
+
+        trade_view_mode = st.radio(
+            "View",
+            ["Individual Trades", "Aggregated FX"],
+            horizontal=True,
+            key=f"trade_view_mode_{APP_VERSION_TAG}",
         )
-        _download_df_csv("Download trades CSV", trades_view_df, f"download_trades_csv_{APP_VERSION_TAG}")
+
+        if trade_view_mode == "Aggregated FX":
+            fx_agg_df = grouped_fx_trades_view(trades_view_df)
+            if fx_agg_df.empty:
+                st.info("No FX trades found. Check your filters or upload a statement with FX positions.")
+            else:
+                _FX_AGG_DEFAULT_COLS = [
+                    c for c in [
+                        "Account Number", "Product", "Type", "CCY 1", "CCY 1 Amount",
+                        "CCY 2", "CCY 2 Amount", "expiryDate", "Quantity", "Net Quantity",
+                        "Unrealised PNL (OTE)", "Trade Count",
+                    ] if c in fx_agg_df.columns
+                ]
+
+                # Split screen: aggregated table on the left, drill-down on the right.
+                # Fixed height keeps both panels visible on screen simultaneously.
+                _FX_TABLE_HEIGHT = 480
+                agg_col, drill_col = st.columns([0.4, 0.6], gap="large")
+
+                with agg_col:
+                    st.caption("Select one or more CCY pairs to see their trades →")
+                    fx_agg_selection = display_custom_table(
+                        "Aggregated FX Trades",
+                        fx_agg_df,
+                        default_columns=_FX_AGG_DEFAULT_COLS,
+                        default_only=True,
+                        selectable=True,
+                        multi_select=True,
+                        selection_key=f"fx_agg_select_{APP_VERSION_TAG}",
+                        table_key_override=f"FX Agg {APP_VERSION_TAG}",
+                        height=_FX_TABLE_HEIGHT,
+                    )
+                    _download_df_csv(
+                        "Download aggregated FX CSV",
+                        fx_agg_df,
+                        f"download_fx_agg_csv_{APP_VERSION_TAG}",
+                    )
+
+                # Collect all selected aggregated rows and union their matching trades.
+                selected_fx_row_idxs = (
+                    fx_agg_selection.selection.rows
+                    if fx_agg_selection and hasattr(fx_agg_selection, "selection")
+                    else []
+                )
+
+                with drill_col:
+                    if not selected_fx_row_idxs:
+                        st.info("Select one or more CCY pairs on the left to see the underlying trades here.")
+                    else:
+                        # Build a union mask across all selected aggregated rows.
+                        union_mask = pd.Series(False, index=trades_view_df.index)
+                        selected_labels = []
+                        for row_idx in selected_fx_row_idxs:
+                            sel = fx_agg_df.iloc[row_idx]
+                            row_mask = pd.Series(True, index=trades_view_df.index)
+                            for col in ["Account Number", "Product", "Type", "CCY 1", "CCY 2", "expiryDate"]:
+                                try:
+                                    val = sel[col]
+                                except (KeyError, IndexError):
+                                    val = None
+                                is_blank = (
+                                    val is None
+                                    or (isinstance(val, float) and pd.isna(val))
+                                    or str(val).strip() in ("", "nan", "None", "NaT", "NaN")
+                                )
+                                if not is_blank and col in trades_view_df.columns:
+                                    row_mask &= trades_view_df[col].astype(str).str.strip() == str(val).strip()
+                            union_mask |= row_mask
+
+                            # Build a readable label for this CCY pair.
+                            ccy1 = str(sel.get("CCY 1", "") or "").strip()
+                            ccy2 = str(sel.get("CCY 2", "") or "").strip()
+                            expiry = str(sel.get("expiryDate", "") or "").strip()
+                            pair = f"{ccy1}/{ccy2}" if ccy1 or ccy2 else "—"
+                            if expiry and expiry not in ("nan", "None", "NaT"):
+                                pair += f" exp {expiry}"
+                            selected_labels.append(pair)
+
+                        fx_drill_df = trades_view_df[union_mask].reset_index(drop=True)
+                        n = len(fx_drill_df)
+                        pairs_str = ", ".join(selected_labels)
+                        st.caption(
+                            f"{n} trade{'s' if n != 1 else ''} for: {pairs_str}"
+                        )
+                        display_custom_table(
+                            "FX Trades",
+                            fx_drill_df,
+                            default_columns=_open_positions_default_columns(fx_drill_df),
+                            default_only=True,
+                            table_key_override=f"FX Drill {APP_VERSION_TAG}",
+                            height=_FX_TABLE_HEIGHT,
+                        )
+                        _download_df_csv(
+                            "Download trades CSV",
+                            fx_drill_df,
+                            f"download_fx_drill_csv_{APP_VERSION_TAG}",
+                        )
+        else:
+            display_custom_table(
+                "Trades",
+                trades_view_df,
+                default_columns=_open_positions_default_columns(trades_view_df),
+                default_only=True,
+                table_key_override=f"Trades {APP_VERSION_TAG}",
+            )
+            _download_df_csv("Download trades CSV", trades_view_df, f"download_trades_csv_{APP_VERSION_TAG}")
 
     with tabs[3]:
         st.caption("Realised P&L from Purchase & Sale (Gross Profit or Loss) rows — parsed using the same column logic as Trades and aggregated using the same presets as Aggregated Positions.")
@@ -1149,9 +1297,9 @@ if extracted_tables:
 
             # Aggregation presets: same as Aggregated Positions
             realised_preset_options = {
-                "Product": {"group_cols": ["product"], "mode": "custom"},
-                "Product + Contract Month/Year": {"group_cols": ["product", "ref_month"], "mode": "custom"},
-                "Account Grouping": {"group_cols": ["account_number", "product", "ref_month", "option_type", "strike"], "mode": "custom"},
+                "Product": {"group_cols": ["product", "exchange"], "mode": "custom"},
+                "Product + Contract Month/Year": {"group_cols": None, "mode": "auto_futures_options"},
+                "Account Grouping": {"group_cols": ["account_number", "product", "ref_month", "trigger_barrier", "option_type", "strike"], "mode": "custom"},
             }
             selected_realised_preset = st.radio(
                 "Realised PNL view",
@@ -1165,6 +1313,7 @@ if extracted_tables:
             realised_grouped_df = grouped_realized_pnl_view(
                 realised_source_tables,
                 realised_preset["group_cols"],
+                mode=realised_preset.get("mode", "custom"),
             )
 
             # Same column order as Aggregated Positions, with "Realised PNL" in place of

@@ -280,12 +280,15 @@ def _map_position_metadata(row: Dict[str, Any]) -> Dict[str, Any]:
     ``masterInstrumentExchangeSymbol``. We pull them from the positions endpoint
     and join on positionId at the caller.
     """
+    # Prefer masterMarketName (e.g. "ASX SPI 200 Index Futures") over productGroup
+    # (e.g. "EquityIndex") so the Product column shows the actual instrument name.
+    market_name = (str(row.get("masterMarketName") or "").strip() or None)
     return {
         "position_id_key":      row.get("id"),
-        "product":              row.get("productGroup"),
+        "product":              market_name or row.get("productGroup"),
         "exchange":             row.get("masterMarketAcronym"),
         "contract_symbol":      row.get("masterInstrumentExchangeSymbol"),
-        "master_market_name":   row.get("masterMarketName"),
+        "master_market_name":   market_name,
         "underlier":            row.get("productUnderlyer"),
     }
 

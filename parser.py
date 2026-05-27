@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import io
 import re
-from typing import Dict, List, Tuple
+from typing import Any, Dict, List, Tuple
 
 import fitz  # PyMuPDF
 import pandas as pd
@@ -3611,23 +3611,58 @@ def _normalize_product_from_description(product_text: str, full_desc: str = "") 
         "COFFEE C": "Coffee",
         "COFFEE P": "Coffee",
         "COTTON": "Cotton",
-        "EAU WHEAT": "Wheat",
+        # ASX/SFE/NZFE instruments — more specific keys must precede shorter overlapping ones.
+        # Equity index
+        "SPI 200 INDEX": "SPI 200 Index",
+        "SPI 200": "SPI 200 Index",
+        "NIKKEI 225": "Nikkei 225",
+        # Interest rate / bonds
+        "10 YEAR T-BOND": "10-Year T-Bond",
+        "10Y T-BOND": "10-Year T-Bond",
+        "3-YEAR TREASURY BOND": "3-Year T-Bond",
+        "3Y T-BOND": "3-Year T-Bond",
+        "BANK BILLS": "Bank Bills",
+        "BANK ACCEPTD BILL": "90-Day Bank Bill",
+        "30 DAY INTERBANK": "30-Day Interbank",
+        # NZ electricity (NZFE) — quarterly variants before base
+        "BENMORE BASELOAD Q": "NZ Benmore Quarterly",
+        "OTAHUHU BASE LOAD Q": "NZ Otahuhu Quarterly",
+        "BENMORE BASELOAD": "NZ Benmore Baseload",
+        "OTAHUHU BASE LOAD": "NZ Otahuhu Baseload",
+        # AU electricity strip options (SFE) — before base-load catch-all
+        "BASE LD NSW STRIP": "NSW Strip",
+        "BASE LD VIC STRIP": "VIC Strip",
+        "BASE LD QLD STRIP": "QLD Strip",
+        "BASE LD SA STRIP": "SA Strip",
+        # AU electricity base-load futures (SFE) — region-specific
+        "NSW BASE LOAD ELEC": "NSW Baseload Electricity",
+        "NSW BASE QLY": "NSW Quarterly Strip",
+        "VIC BASE LOAD ELEC": "VIC Baseload Electricity",
+        "VIC BASE QLY": "VIC Quarterly Strip",
+        "QLD BASE LOAD ELEC": "QLD Baseload Electricity",
+        "QLD BASE QLY": "QLD Quarterly Strip",
+        "SA BASE LOAD ELEC": "SA Baseload Electricity",
+        "SA BASE QLY": "SA Quarterly Strip",
+        # Grains
+        "EASTERN AUSTRALIA WHEAT": "Eastern Australia Wheat",
+        "EAU WHEAT": "Eastern Australia Wheat",
         "WHEAT": "Wheat",
+        "AUST FEED BARLEY": "Feed Barley",
+        "FEED BARLEY": "Feed Barley",
         "BARLEY": "Barley",
-        "SPI 200": "SPI 200",
-        "10Y T-BOND": "10Y T-BOND",
-        "3Y T-BOND": "3Y T-BOND",
-        "NIKKEI 225": "NIKKEI 225",
+        # Metals / dairy / rubber
         "IRON ORE F": "Iron Ore",
         "IRON ORE": "Iron Ore",
         "SKMILK": "Skim Milk",
         "SKIM MILK": "Skim Milk",
         "WHOLE MILK": "Whole Milk",
         "WHMILK": "Whole Milk",
-        "USD/KRW": "USD/KRW",
-        "INR/USD": "INR/USD",
         "TSR20RUBBR": "TSR20 Rubber",
         "RUBBR": "Rubber",
+        # FX
+        "USD/KRW": "USD/KRW",
+        "INR/USD": "INR/USD",
+        # Agricultural (CBOT / CME)
         "CORN": "Corn",
         # Multi-word variants must come before the bare "SOYBEAN" entry,
         # because the lookup uses substring matching.
@@ -3665,7 +3700,7 @@ def parse_contract_product(desc: str | None) -> dict:
     desc = "" if desc is None else str(desc).strip()
     upper = " ".join(desc.upper().split())
 
-    exchanges = "LME|SCM|BMF|CBOT|CBT|NYMEX|NYME|CME|ICE|IFUS|MATF|MGEX|IMM|ASX|SFE|SGX|KFX|NZF|ABX|TOCOM|FX"
+    exchanges = "LME|SCM|BMF|CBOT|CBT|NYMEX|NYME|CME|ICE|IFUS|MATF|MGEX|IMM|ASX|SFE|SGX|KFX|NZFE|NZF|ABX|TOCOM|FX"
     months = "JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC"
 
     option_type = "Call" if re.search(r"\b(CALL|C)\b", upper) else ("Put" if re.search(r"\b(PUT|P|PULL)\b", upper) else None)
@@ -3710,7 +3745,7 @@ def parse_contract_product(desc: str | None) -> dict:
     # match with ccy1=JUL, amount=26, ccy2=CBT — producing a bogus "JUL/CBT" FX product).
     _MONTH_ABBREVS = {"JAN","FEB","MAR","APR","MAY","JUN","JUL","AUG","SEP","OCT","NOV","DEC"}
     _EXCHANGE_ABBREVS = {"LME","SCM","BMF","CBOT","CBT","NYMEX","NYME","CME","ICE","IFUS",
-                         "MATF","MGEX","IMM","ASX","SFE","SGX","KFX","NZF","ABX","TOCOM"}
+                         "MATF","MGEX","IMM","ASX","SFE","SGX","KFX","NZFE","NZF","ABX","TOCOM"}
     murex_fx_m = re.match(r"^([A-Z]{3})\s+\(?[\d,.]+\)?\s+([A-Z]{3})\b", upper)
     if (murex_fx_m
             and murex_fx_m.group(1) not in _MONTH_ABBREVS
@@ -3752,6 +3787,30 @@ def parse_contract_product(desc: str | None) -> dict:
         m2 = re.search(rf"\b({exchanges})\b\s+(.+?)(?=\s+\d+(?:\.\d+)?(?:\s|$))", upper, re.I)
         exchange = m2.group(1).upper() if m2 else None
         product_text = m2.group(2).strip() if m2 else upper
+
+    # When the exchange resolves to "FX", the text after "FX" is the direction/month
+    # (e.g. "FWD AUG-26"), NOT a product name. The true product identity is the
+    # currency pair that precedes "FX" in the description (e.g. "USD/BRL").
+    # We return "FX USD/BRL" so that:
+    #   (a) all trades in the same pair share one product regardless of expiry date
+    #       → essential for the Product aggregation grouping to collapse correctly, and
+    #   (b) the "FX " prefix keeps _fx_position_mask detection working.
+    if exchange == "FX":
+        ccy_pair_m = re.search(r"\b([A-Z]{3})/([A-Z]{3})\b", upper)
+        if ccy_pair_m:
+            ccy_pair = f"{ccy_pair_m.group(1)}/{ccy_pair_m.group(2)}"
+            # Return immediately — no further normalization needed for FX pairs.
+            return {
+                "product": f"FX {ccy_pair}",
+                "exchange": "FX",
+                "product_name": f"FX {ccy_pair}",
+                "strike": strike_value,
+                "option_type": option_type,
+                "option_style": option_style,
+                "unit": None,
+            }
+        # If no explicit ccy_pair, retain whatever _normalize_product_from_description
+        # finds — it may already have a sensible mapping for the product_text token.
 
     unit_match = re.search(r"\b[A-Z]{3}/([A-Z]+)\b", upper)
     product_name = _normalize_product_from_description(product_text, desc)
@@ -5557,13 +5616,18 @@ def closed_positions_standard_view(tables: Dict[str, pd.DataFrame]) -> pd.DataFr
 
 def grouped_realized_pnl_view(
     tables: Dict[str, pd.DataFrame],
-    group_cols: list[str],
+    group_cols: list[str] | None,
+    mode: str = "custom",
 ) -> pd.DataFrame:
     """Aggregate closed positions by the given keys, summing Realised PNL.
 
     Uses the same column normalisation as closed_positions_standard_view and
     applies _apply_conditional_position_columns so CCY / option visibility
     mirrors the Aggregated Positions view.
+
+    mode="auto_futures_options" uses product + exchange + ref_month and also
+    adds option_type + strike when option rows are present, matching the
+    Product + Contract Month/Year preset in Aggregated Positions.
     """
     df = closed_positions_standard_view(tables)
     if df is None or df.empty:
@@ -5571,16 +5635,33 @@ def grouped_realized_pnl_view(
 
     display_group_col_map = {
         "product":        "Product",
+        "exchange":       "Exchange",
         "ref_month":      "Contract Month/Year",
         "account_number": "Account Number",
         "trigger_barrier":"Trigger/Barrier",
         "option_type":    "Call/Put",
         "strike":         "strikePrice",
     }
-    resolved = [display_group_col_map.get(c, c) for c in group_cols]
+
+    # auto_futures_options: mirror the Product + Contract Month/Year preset —
+    # group by product + exchange + ref_month, add option cols when options present.
+    if mode == "auto_futures_options":
+        base = ["product", "exchange", "ref_month"]
+        has_options = (
+            "Call/Put" in df.columns
+            and df["Call/Put"].notna().any()
+            and df["Call/Put"].astype(str).str.strip().str.lower().ne("").any()
+        )
+        if has_options:
+            base += ["option_type", "strike"]
+        effective_cols = base
+    else:
+        effective_cols = list(group_cols or [])
+
+    resolved = [display_group_col_map.get(c, c) for c in effective_cols]
     available = [c for c in resolved if c in df.columns]
     if not available:
-        available = [c for c in ["Product", "Contract Month/Year"] if c in df.columns]
+        available = [c for c in ["Product", "Exchange", "Contract Month/Year"] if c in df.columns]
 
     # Aggregate: sum Realised PNL, Net Quantity, Long, Short.
     # NOV / settlementPrice / Avg Fill Price use _unique_or_multiple (same as other descriptive cols).
@@ -5602,6 +5683,68 @@ def grouped_realized_pnl_view(
             grouped.loc[grouped[col].fillna(0) == 0, col] = None
 
     return _apply_conditional_position_columns(grouped)
+
+
+def grouped_fx_trades_view(df: pd.DataFrame) -> pd.DataFrame:
+    """Aggregate FX trade rows by Account, Product, Type, CCY 1, CCY 2, and Expiry Date.
+
+    Takes the output of ``standard_position_view_from_df`` (or the trades view
+    dataframe, which uses "Quantity" instead of "Net Quantity") and returns one
+    aggregated row per unique (Account Number, Product, Type, CCY 1, CCY 2,
+    expiryDate) combination, with:
+
+      - CCY 1 Amount / CCY 2 Amount — summed net notional
+      - Quantity — summed net quantity
+      - Unrealised PNL (OTE) — summed OTE (when available)
+      - Trade Count — number of underlying individual trades
+
+    Handles both "Quantity" (trades view) and "Net Quantity" (standard view)
+    column names transparently.
+    """
+    if df is None or df.empty:
+        return pd.DataFrame()
+
+    # Work on a copy; normalise to a single quantity column name.
+    work = df.copy()
+    qty_col = "Quantity" if "Quantity" in work.columns else "Net Quantity" if "Net Quantity" in work.columns else None
+
+    # Filter to FX rows only.
+    if "Type" in work.columns:
+        type_upper = work["Type"].astype(str).str.strip().str.upper()
+        fx_mask = type_upper.str.startswith("FX") | type_upper.isin(["NDO"])
+    else:
+        fx_mask = pd.Series(False, index=work.index)
+
+    fx_df = work[fx_mask].copy()
+    if fx_df.empty:
+        return pd.DataFrame()
+
+    # Group keys — only include columns that actually exist.
+    group_cols = [c for c in ["Account Number", "Product", "Type", "CCY 1", "CCY 2", "expiryDate"] if c in fx_df.columns]
+
+    # Build aggregation spec: sum numeric risk columns, count rows.
+    fx_df["_trade_count"] = 1
+    agg: Dict[str, Any] = {"_trade_count": "sum"}
+
+    for col in ["CCY 1 Amount", "CCY 2 Amount", "Unrealised PNL (OTE)"]:
+        if col in fx_df.columns:
+            agg[col] = "sum"
+
+    if qty_col and qty_col in fx_df.columns:
+        agg[qty_col] = "sum"
+
+    try:
+        grouped = fx_df.groupby(group_cols, dropna=False).agg(agg).reset_index()
+    except Exception:
+        return fx_df.drop(columns=["_trade_count"], errors="ignore").reset_index(drop=True)
+
+    grouped = grouped.rename(columns={"_trade_count": "Trade Count"})
+
+    # Reorder columns for legibility.
+    leading = [c for c in ["Account Number", "Product", "Type", "CCY 1", "CCY 2", "expiryDate"] if c in grouped.columns]
+    numeric = [c for c in ["CCY 1 Amount", "CCY 2 Amount", qty_col or "", "Unrealised PNL (OTE)", "Trade Count"] if c and c in grouped.columns]
+    rest = [c for c in grouped.columns if c not in leading and c not in numeric]
+    return grouped[leading + numeric + rest].reset_index(drop=True)
 
 
 def statement_dates_by_account(tables: Dict[str, pd.DataFrame]) -> pd.DataFrame:

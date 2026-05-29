@@ -23,8 +23,8 @@ from parser import (
     _apply_conditional_position_columns,
 )
 
-APP_VERSION_TAG = "v93"
-APP_VERSION_DESCRIPTION = "Drop CCY columns from Aggregated Positions in all views, not just FX"
+APP_VERSION_TAG = "v95"
+APP_VERSION_DESCRIPTION = "Remove ccy_1/ccy_2 from FX grouping keys — Product name already encodes the CCY pair"
 
 st.set_page_config(page_title="MyStoneX Positions", layout="wide")
 st.title("MyStoneX Positions")
@@ -1075,7 +1075,9 @@ if extracted_tables:
 
         # Product preset: Contract Month/Year and expiryDate are not grouping keys — exclude.
         # Exception: expiryDate is kept for options (strike/expiry pair) and accumulators.
-        _preset_exclude = {"Contract Month/Year", "settlementPrice"} if selected_preset == "Product" else set()
+        # Currency is also excluded from the Product preset for all asset classes — it is a
+        # low-level field not useful at product-level aggregation.
+        _preset_exclude = {"Contract Month/Year", "settlementPrice", "Currency"} if selected_preset == "Product" else set()
         if selected_preset == "Product" and not _grouped_has_options and not _grouped_has_accumulators:
             _preset_exclude.add("expiryDate")
 
@@ -1088,15 +1090,28 @@ if extracted_tables:
         )
         _preset_exclude.update({"CCY 1", "CCY 1 Amount", "CCY 2", "CCY 2 Amount"})
 
-        # For purely FX views also hide Exchange and Currency from defaults.
+        # Detect FX and OTC/Accumulator presence in the view.
         if "Type" in grouped_pos_df.columns:
             _type_vals = grouped_pos_df["Type"].dropna().astype(str).str.strip().str.upper()
-            _type_vals = _type_vals[_type_vals.str.lower().ne("multiple") & _type_vals.ne("")]
-            _all_fx = _type_vals.str.startswith("FX").all() | _type_vals.isin(["NDO"]).all() if not _type_vals.empty else False
+            _type_vals_clean = _type_vals[_type_vals.str.lower().ne("multiple") & _type_vals.ne("")]
+            _all_fx = (
+                _type_vals_clean.str.startswith("FX").all() | _type_vals_clean.isin(["NDO"]).all()
+                if not _type_vals_clean.empty else False
+            )
+            _has_fx = _type_vals_clean.str.startswith("FX").any() | _type_vals_clean.isin(["NDO"]).any()
         else:
             _all_fx = False
-        if _all_fx:
-            _preset_exclude.update({"Exchange", "Currency"})
+            _has_fx = False
+
+        # Hide Exchange from defaults whenever the view contains any FX or OTC/Accumulator rows —
+        # Exchange is either "FX" (uninformative) or absent for OTC products.
+        if _has_fx or _grouped_has_accumulators:
+            _preset_exclude.add("Exchange")
+
+        # For purely FX views also hide Currency from non-Product presets (Product preset already
+        # excludes Currency above).
+        if _all_fx and selected_preset != "Product":
+            _preset_exclude.add("Currency")
 
         # expiryDate IS a grouping key for Product + Contract Month/Year and Account Grouping
         # (replaces ref_month when available; explicit key for FX rows) — always force-include.

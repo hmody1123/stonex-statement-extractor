@@ -4066,18 +4066,22 @@ def _fx_group_cols_for_base(group_cols: list[str] | None, mode: str = "custom") 
     Product grouping remains a product-level summary. Product + Contract
     Month/Year and Account Grouping keep FX option/NDO economics by adding
     Call/Put and strike to the key. Plain FX forwards/spots/swaps have those
-    fields blank, so they continue grouping by product/currencies/expiry only.
+    fields blank, so they continue grouping by product/expiry only.
+
+    ccy_1/ccy_2 are intentionally excluded — parse_contract_product now
+    encodes the CCY pair directly in the product name (e.g. "FX USD/BRL"),
+    so those fields are redundant grouping keys and are not shown in the UI.
     """
     base = [str(c) for c in (group_cols or [])]
     base_set = set(base)
     fx_option_keys = ["option_type", "strike"]
     if mode == "product_month":
-        return ["product", "position_type", "ccy_1", "ccy_2", "expiry_date"] + fx_option_keys
+        return ["product", "position_type", "expiry_date"] + fx_option_keys
     if "account_number" in base_set:
-        return ["account_number", "product", "position_type", "ccy_1", "ccy_2", "expiry_date"] + fx_option_keys
+        return ["account_number", "product", "position_type", "expiry_date"] + fx_option_keys
     if base_set <= {"product", "exchange"}:
         return [c for c in ["product", "exchange"] if c in base]
-    return ["product", "position_type", "ccy_1", "ccy_2", "expiry_date"] + fx_option_keys
+    return ["product", "position_type", "expiry_date"] + fx_option_keys
 
 
 def _group_prepared_positions_with_fx(

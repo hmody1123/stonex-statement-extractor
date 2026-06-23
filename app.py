@@ -24,8 +24,71 @@ from parser import (
     _apply_conditional_position_columns,
 )
 
-APP_VERSION_TAG = "v95"
-APP_VERSION_DESCRIPTION = "Remove ccy_1/ccy_2 from FX grouping keys — Product name already encodes the CCY pair"
+APP_VERSION_TAG = "v96"
+APP_VERSION_DESCRIPTION = "Consistent column order across all tabs via MASTER_COLUMN_ORDER"
+
+# ── Master column order ───────────────────────────────────────────────────────
+# Single source of truth for the left→right column ordering that every tab
+# follows.  Each tab may show a different *subset* of these columns, but the
+# relative order of any two columns that appear together is always the same.
+MASTER_COLUMN_ORDER = [
+    # Product identity
+    "Product", "Type", "Exchange", "Contract", "expiryDate",
+    "Contract Description",
+    # Option / accumulator specifics
+    "Call/Put", "strikePrice", "Trigger/Barrier", "Delta",
+    # FX specifics
+    "CCY 1", "CCY 1 Amount", "CCY 2", "CCY 2 Amount", "Currency",
+    # Account
+    "Account Number", "Broker Code",
+    # Trade IDs / dates
+    "Global ID", "Trade ID", "Trade Date", "Close Date", "Entry Time",
+    # Quantity / direction
+    "Direction", "Quantity", "Long", "Short",
+    "Net Quantity",  # grouped views only (renamed to Quantity in trade-detail views)
+    "Original Quantity", "Ref Price", "Trade Price",
+    "Avg Fill Price",  # grouped views only (renamed to Trade Price in trade-detail views)
+    # Settlement / valuation
+    "settlementPrice", "Settlement Price Time", "NOV",
+    # PNL
+    "Unrealised PNL (OTE)", "Real Unrealised PNL (OTE)",
+    "Realised PNL", "Debit/Credit", "Market Value",
+    # Admin / misc
+    "Last Update Time", "✕ Close",
+    "Trade Count", "Row Type", "sourceSystem",
+]
+
+_MASTER_COL_RANK = {c: i for i, c in enumerate(MASTER_COLUMN_ORDER)}
+
+
+def _apply_master_col_order(cols):
+    """Return *cols* sorted by MASTER_COLUMN_ORDER; unknown columns appended last."""
+    n = len(MASTER_COLUMN_ORDER)
+    return sorted(cols, key=lambda c: _MASTER_COL_RANK.get(c, n))
+
+
+# Shared column list for every trade-level detail / drill-down view.
+# Covers both Open Positions (which has Quantity, Trade Price, etc.) and
+# Realised PNL (which has Net Quantity, Avg Fill Price, Close Date, Realised PNL).
+# Each view shows only the subset that exists in its dataframe.
+TRADE_DETAIL_DEFAULT_COLUMNS = _apply_master_col_order([
+    "Product", "Type", "Exchange", "Contract", "expiryDate",
+    "Contract Description",
+    "Call/Put", "strikePrice", "Trigger/Barrier",
+    "CCY 1", "CCY 1 Amount", "CCY 2", "CCY 2 Amount", "Currency",
+    "Account Number", "Broker Code",
+    "Global ID", "Trade ID", "Trade Date", "Close Date", "Entry Time",
+    "Direction", "Quantity",
+    "Ref Price", "Original Quantity",
+    "Trade Price",
+    "settlementPrice", "Settlement Price Time",
+    "Unrealised PNL (OTE)", "Realised PNL", "Debit/Credit",
+])
+
+
+def _trade_detail_default_columns(df):
+    """Return TRADE_DETAIL_DEFAULT_COLUMNS filtered to columns present in *df*."""
+    return [c for c in TRADE_DETAIL_DEFAULT_COLUMNS if c in df.columns]
 
 st.set_page_config(page_title="MyStoneX Positions", layout="wide")
 
@@ -169,7 +232,7 @@ def _cached_extract(pdf_bytes: bytes, include_open_positions: bool):
     Keyed by the raw PDF bytes — Streamlit hashes them automatically. Returns a
     Dict[str, DataFrame] that callers must not mutate (see add_source_pdf).
 
-    Cache version: v93 (Drop CCY columns from all Aggregated Positions views)
+    Cache version: v93 (Drop CCY columns from all Open Positions views)
     """
     return extract(pdf_bytes, include_open_positions=include_open_positions)
 
@@ -180,8 +243,16 @@ def _cached_to_excel_bytes(_tables, cache_key: str):
 
     cache_key carries the identity (typically derived from pdf_bytes hashes and
     include_open_positions) so Streamlit can invalidate when inputs change.
+
+    IMPORTANT: st.* commands must NOT be called inside @st.cache_data functions.
+    Errors are returned as empty bytes; the caller is responsible for surfacing
+    a warning to the user.
     """
-    return to_excel_bytes(_tables)
+    try:
+        result = to_excel_bytes(_tables)
+        return result if result else b""
+    except Exception:
+        return b""
 
 def clean_for_display(df):
     if df is None:
@@ -202,13 +273,43 @@ def _display_series_nonblank(series):
     return series.notna() & ~text.isin(["", "none", "nan", "nat", "unknown", "other", "multiple"])
 
 
+def _add_direction_column(df, qty_col="Net Quantity", abs_qty=False):
+    """Derive a Direction column from a signed quantity column.
+
+    Long  → qty > 0
+    Short → qty < 0
+    (blank when qty is zero or NaN)
+
+    The column is inserted immediately before qty_col so it sits naturally
+    next to the quantity figure in the table.
+
+    When abs_qty=True the quantity column itself is replaced with its absolute
+    value after Direction is derived — Direction then carries the full sign
+    information and the quantity figure stays unsigned.
+    """
+    if df is None or df.empty or qty_col not in df.columns:
+        return df
+    df = df.copy()
+    qty = pd.to_numeric(df[qty_col], errors="coerce")
+    direction = qty.map(lambda q: "Long" if pd.notna(q) and q > 0 else ("Short" if pd.notna(q) and q < 0 else ""))
+    if "Direction" in df.columns:
+        # Column already present (e.g. carried over from parser); update values in-place.
+        df["Direction"] = direction
+    else:
+        insert_pos = df.columns.get_loc(qty_col)
+        df.insert(insert_pos, "Direction", direction)
+    if abs_qty:
+        df[qty_col] = qty.abs()
+    return df
+
+
 def _open_positions_default_columns(df):
     defaults = [c for c in OPEN_POSITION_COLUMNS if c in df.columns]
     # Keep expiryDate available in Customize table even when blank, but do not
     # show an all-blank expiryDate column by default.
     if "expiryDate" in df.columns and not _display_series_nonblank(df["expiryDate"]).any():
         defaults = [c for c in defaults if c != "expiryDate"]
-    return defaults
+    return _apply_master_col_order(defaults)
 
 
 OPTION_DISPLAY_COLUMNS = ["Call/Put", "strikePrice"]
@@ -219,7 +320,7 @@ def _has_option_positions(df):
 
     Non-option rows usually carry blank/None Call/Put and strikePrice values.
     When neither field is populated anywhere, hide those option-only columns from
-    Trades and Aggregated Positions so futures/FX-only PDFs stay cleaner.
+    Trades and Open Positions so futures/FX-only PDFs stay cleaner.
     """
     if df is None or df.empty:
         return False
@@ -346,7 +447,7 @@ def _best_last_update(trades_df, merged_tables):
     for df in [trades_df, merged_tables.get("Statement Dates", pd.DataFrame()) if isinstance(merged_tables, dict) else pd.DataFrame()]:
         if df is None or df.empty:
             continue
-        for col in ["Last Update", "last_update", "statement_date", "Statement Date", "Trade Date"]:
+        for col in ["Last Update Time", "last_update", "statement_date", "Statement Date", "Trade Date"]:
             if col in df.columns:
                 parsed = pd.to_datetime(df[col], errors="coerce")
                 if parsed.notna().any():
@@ -371,7 +472,7 @@ def _summary_metrics(trades_df, standard_positions_df, merged_tables):
         ("Total Unrealised PNL", _metric_money(_total_ote_for_summary(standard_positions_df)), "Non-option OTE / MTM using Market Value when available."),
         ("Total NOV", _metric_money(_total_nov_for_summary(standard_positions_df)), "Option value from option Market Value."),
         ("Total Market Value", _metric_money(_sum_numeric(standard_positions_df, ["Market Value", "market_value", "market_value_signed"])), "Total market value when supplied."),
-        ("Data Last Updated", _best_last_update(trades_df, merged_tables), "Latest statement/update date in the upload."),
+        ("Data Last Update Timed", _best_last_update(trades_df, merged_tables), "Latest statement/update date in the upload."),
     ]
 
 
@@ -443,7 +544,7 @@ def _render_home_page(trades_df, standard_positions_df, merged_tables, extracted
         st.markdown("**What you can do from here**")
         st.markdown(
             """
-            - **Aggregated Positions**: group trades by Product, Product + expiry/contract month, or Account.
+            - **Open Positions**: group trades by Product, Product + expiry/contract month, or Account.
             - **Trades**: inspect the row-level trade records and apply filters.
             - **Position Details / Drill-down**: review the trades behind the selected aggregated row.
             - **Exceptions / Data Quality**: check missing fields and parser/data quality messages.
@@ -477,7 +578,7 @@ def _download_df_csv(label, df, key):
 def _date_candidates(df):
     if df is None or df.empty:
         return []
-    preferred = ["expiryDate", "Trade Date", "Last Update", "statement_date", "Statement Date"]
+    preferred = ["expiryDate", "Trade Date", "Last Update Time", "statement_date", "Statement Date"]
     return [c for c in preferred if c in df.columns]
 
 
@@ -546,7 +647,7 @@ def _render_clearing_view_toggle(key_prefix):
 
 
 def _render_position_search_controls(base_view_df, key_prefix):
-    """Render account/product/type/exchange/currency/date filters for Trades and Aggregated Positions.
+    """Render account/product/type/exchange/currency/date filters for Trades and Open Positions.
 
     Exchange renders before Product so selecting an exchange dynamically narrows the product list.
     """
@@ -919,11 +1020,11 @@ def _open_positions_for_group(open_df, selected_group_row, selected_preset):
 
     if selected_preset == "Product":
         pass
-    elif selected_preset == "Account Grouping":
+    elif selected_preset == "Account":
         mask = _apply_text_filter(mask, df, "Trigger/Barrier", row.get("Trigger/Barrier"))
         mask = _apply_text_filter(mask, df, "Account Number", row.get("Account Number"))
         mask = _apply_contract_or_expiry_drill_filter(mask, df, row)
-        # Account Grouping keeps option detail. Futures/non-options have blank option keys,
+        # Account keeps option detail. Futures/non-options have blank option keys,
         # while options filter by Call/Put + strike.
         call_put = row.get("Call/Put")
         strike = row.get("strikePrice")
@@ -955,6 +1056,35 @@ def _open_positions_for_group(open_df, selected_group_row, selected_preset):
             if "strikePrice" in df.columns:
                 mask = mask & _blank_series_mask(df["strikePrice"])
 
+    return df[mask].reset_index(drop=True)
+
+
+def _realised_trades_for_group(detail_df, selected_row, selected_preset):
+    """Filter closed_positions_standard_view output to the individual Trade legs
+    that belong to a selected grouped Realised PNL row.
+
+    Cannot use _open_positions_for_group here because that function filters by
+    expiryDate (taken from the Net P&L summary row), but individual Trade rows
+    don't carry close_date so their expiryDate is blank — they would all be
+    filtered out.  Instead we filter by Product + Exchange + (Account + Contract
+    when the preset includes those keys).
+    """
+    if detail_df is None or detail_df.empty or selected_row is None:
+        return pd.DataFrame()
+    df = detail_df.copy()
+    # Only show individual leg rows, not the Net P&L summary rows.
+    if "Row Type" in df.columns:
+        df = df[df["Row Type"] == "Trade"].reset_index(drop=True)
+    if df.empty:
+        return df
+    mask = pd.Series(True, index=df.index)
+    mask = _apply_text_filter(mask, df, "Product",        selected_row.get("Product"))
+    mask = _apply_text_filter(mask, df, "Exchange",       selected_row.get("Exchange"))
+    mask = _apply_text_filter(mask, df, "Type",           selected_row.get("Type"))
+    if selected_preset in {"Contract", "Account", "Product + Contract Month/Year"}:
+        mask = _apply_text_filter(mask, df, "Contract",   selected_row.get("Contract"))
+    if not _is_blank_drill_value(selected_row.get("Account Number")):
+        mask = _apply_text_filter(mask, df, "Account Number", selected_row.get("Account Number"))
     return df[mask].reset_index(drop=True)
 
 
@@ -1011,30 +1141,16 @@ def _render_drilldown_content(drill_df, selected_group_row, selected_preset, sig
     display_custom_table(
         "Selected Group Trades",
         drill_df,
-        default_columns=OPEN_POSITION_COLUMNS,
+        default_columns=_trade_detail_default_columns(drill_df),
         default_only=False,
     )
 
 
 def _show_drilldown_widget(drill_df, selected_group_row, selected_preset, sig):
-    """Show drill-down as a separate closable widget. Uses st.dialog when available."""
-    title = "Trades making up selected group"
-    if hasattr(st, "dialog"):
-        try:
-            dialog_decorator = st.dialog(title, width="large")
-        except TypeError:
-            dialog_decorator = st.dialog(title)
-
-        @dialog_decorator
-        def _dialog():
-            _render_drilldown_content(drill_df, selected_group_row, selected_preset, sig)
-
-        _dialog()
-    else:
-        # Fallback for older Streamlit versions: still separate and closable, just inline.
-        with st.container(border=True):
-            st.subheader(title)
-            _render_drilldown_content(drill_df, selected_group_row, selected_preset, sig)
+    """Show drill-down inline below the aggregated positions table."""
+    with st.container(border=True):
+        st.subheader("Trades making up selected group")
+        _render_drilldown_content(drill_df, selected_group_row, selected_preset, sig)
 
 
 def _unwrap_envelope(parsed):
@@ -1109,6 +1225,8 @@ if extracted_tables:
     else:
         _excel_cache_key = f"api|{include_trades}|{id(merged_tables)}"
     merged_excel = _cached_to_excel_bytes(merged_tables, _excel_cache_key)
+    if not merged_excel:
+        st.toast("Excel export could not be generated for this statement.", icon="⚠️")
     open_positions_base_view_df = open_positions_standard_view(merged_tables)
     has_option_positions = _has_option_positions(open_positions_base_view_df)
 
@@ -1120,7 +1238,7 @@ if extracted_tables:
 
     tabs = st.tabs([
         "Home",
-        "Aggregated Positions",
+        "Open Positions",
         "Trades",
         "Realised PNL",
         "Position Details / Drill-down",
@@ -1146,7 +1264,7 @@ if extracted_tables:
                 "mode": "auto_futures_options",
                 "group_cols": None,
             },
-            "Account Grouping": {
+            "Account": {
                 "description": "Ownership view by account + product and expiry/value/end date when available, otherwise contract month/year. OTC rows keep Trigger/Barrier; options also keep Call/Put + Strike Price.",
                 "mode": "custom",
                 "group_cols": ["account_number", "product", "ref_month", "trigger_barrier", "option_type", "strike"],
@@ -1158,7 +1276,7 @@ if extracted_tables:
         grouped_open_base_view_df = open_positions_standard_view(grouped_source_tables)
 
         selected_preset = st.radio(
-            "Aggregated Positions view",
+            "Open Positions view",
             options=list(grouping_presets.keys()),
             horizontal=True,
             key=f"aggregated_positions_preset_view_{APP_VERSION_TAG}",
@@ -1170,7 +1288,7 @@ if extracted_tables:
         else:
             grouped_pos_df = grouped_positions_standard_view(grouped_source_tables, preset["group_cols"])
             st.write("Grouping by:", selected_preset)
-        st.caption(preset["description"] + " NOV carries option OTE; option rows leave OTE blank. Trade Price, Ref Price, and Original Quantity remain available in Trades, not Aggregated Positions.")
+        st.caption(preset["description"] + " NOV carries option OTE; option rows leave OTE blank. Trade Price, Ref Price, and Original Quantity remain available in Trades, not Open Positions.")
 
         grouped_pos_df = grouped_pos_df.drop(columns=["Contract Description", "Full Name"], errors="ignore")
         grouped_pos_df = prepare_grouped_positions_display(
@@ -1179,15 +1297,26 @@ if extracted_tables:
             selected_preset=selected_preset,
             drop_option_columns=(selected_preset == "Product"),
         )
+
         if "Call/Put" not in grouped_pos_df.columns:
             st.caption("No option rows detected, so Call/Put and strikePrice are hidden from position views.")
         if selected_preset in {"Product", "Contract"}:
             grouped_pos_df = grouped_pos_df.drop(columns=["Account Number"], errors="ignore")
+        # Add Direction (Long/Short) derived from Net Quantity. Must be added before
+        # _has_option_positions / _apply_conditional_position_columns so it is present
+        # in _conditional_cols and flows naturally into grouped_default_columns.
+        grouped_pos_df = _add_direction_column(grouped_pos_df, "Net Quantity", abs_qty=True)
+
         # Pre-selected columns: use conditional logic to check only relevant columns by default.
         # The picker always shows ALL GROUPED_POSITION_COLUMNS (ensured by prepare_grouped_positions_display).
-        _conditional_cols = set(_apply_conditional_position_columns(grouped_pos_df.copy()).columns)
-        # Detect what's in the data to drive smart pre-selection.
+        # Detect option/accumulator presence BEFORE applying conditional column drops,
+        # so the flags are accurate. Then apply the drops to the real df so blank
+        # option columns (Call/Put, Delta, NOV, strikePrice) are physically absent —
+        # this prevents stale checkbox widget state from making them reappear in the
+        # column picker or table when there are no options in the current view.
         _grouped_has_options      = _has_option_positions(grouped_pos_df)
+        grouped_pos_df            = _apply_conditional_position_columns(grouped_pos_df, drop_empty_expiry=False)
+        _conditional_cols         = set(grouped_pos_df.columns)
         _grouped_has_accumulators = "Trigger/Barrier" in _conditional_cols  # non-blank TB → accumulator
 
         # Product preset: Contract Month/Year and expiryDate are not grouping keys — exclude.
@@ -1199,7 +1328,7 @@ if extracted_tables:
         if selected_preset == "Product" and not _grouped_has_options and not _grouped_has_accumulators:
             _preset_exclude.add("expiryDate")
 
-        # CCY 1/2 and their amounts are removed from the Aggregated Positions table
+        # CCY 1/2 and their amounts are removed from the Open Positions table
         # in all views — they are trade-level FX detail and not useful in a grouped
         # summary regardless of whether the view is purely FX or mixed.
         # Realised PNL belongs only to the Realised PNL tab.
@@ -1207,7 +1336,8 @@ if extracted_tables:
             columns=["CCY 1", "CCY 1 Amount", "CCY 2", "CCY 2 Amount", "Realised PNL"],
             errors="ignore",
         )
-        _preset_exclude.update({"CCY 1", "CCY 1 Amount", "CCY 2", "CCY 2 Amount", "Realised PNL"})
+        # Last Update Time and Entry Time are available but hidden by default in all presets.
+        _preset_exclude.update({"CCY 1", "CCY 1 Amount", "CCY 2", "CCY 2 Amount", "Realised PNL", "Last Update Time", "Entry Time"})
 
         # Detect FX and OTC/Accumulator presence in the view.
         if "Type" in grouped_pos_df.columns:
@@ -1232,65 +1362,81 @@ if extracted_tables:
         if _all_fx and selected_preset != "Product":
             _preset_exclude.add("Currency")
 
-        # expiryDate IS a grouping key for Contract and Account Grouping
+        # expiryDate IS a grouping key for Contract and Account
         # (replaces ref_month when available; explicit key for FX rows) — always force-include.
         # Trigger/Barrier is a grouping key when accumulators are present — always force-include.
         _force_include = set()
-        if selected_preset in {"Contract", "Account Grouping"}:
+        if selected_preset in {"Contract", "Account"}:
             _force_include.add("expiryDate")
         if _grouped_has_accumulators:
             _force_include.update({"Trigger/Barrier", "expiryDate"})
 
-        grouped_default_columns = [
+        grouped_default_columns = _apply_master_col_order([
             c for c in GROUPED_POSITION_COLUMNS
             if c != "Type"
             and c not in _preset_exclude
             and (c in _conditional_cols or c in _force_include)
-        ]
+        ])
 
-        st.caption("Click a row in the Aggregated Positions table to view the trade rows that make up that group.")
-        group_selection = display_custom_table(
-            f"Aggregated Positions - {selected_preset}",
-            grouped_pos_df,
-            default_columns=grouped_default_columns,
-            default_only=True,
-            selectable=True,
-            selection_key=f"aggregated_positions_row_selection_{_safe_key(selected_preset)}_{APP_VERSION_TAG}",
-            table_key_override=f"Aggregated Positions {selected_preset} {APP_VERSION_TAG}",
-        )
-        latest_aggregated_df = grouped_pos_df.copy()
-        _download_df_csv("Download aggregated positions CSV", grouped_pos_df, f"download_aggregated_positions_{_safe_key(selected_preset)}_{APP_VERSION_TAG}")
+        # In Real Time + Cleared View add a per-row ✕ Close column at the far right.
+        # The column is a static text scaffold — non-functional until the Close Position
+        # API is integrated. It is appended after default_columns so it always appears last.
+        if aggregated_clearing_view == "Real Time + Cleared View":
+            grouped_pos_df = grouped_pos_df.copy()
+            grouped_pos_df["✕ Close"] = "✕"
+            grouped_default_columns = grouped_default_columns + ["✕ Close"]
 
-        selected_rows = _event_selected_rows(group_selection)
-        selected_group = None
-        selected_sig = None
-        if selected_rows:
-            selected_pos = selected_rows[0]
-            if 0 <= selected_pos < len(grouped_pos_df):
-                selected_group = grouped_pos_df.iloc[selected_pos]
-                selected_sig = _drilldown_signature(selected_group, selected_preset)
-                if st.session_state.get("drilldown_closed_signature") != selected_sig:
-                    st.session_state["drilldown_row"] = selected_group.to_dict()
-                    st.session_state["drilldown_preset"] = selected_preset
-                    st.session_state["drilldown_signature"] = selected_sig
-                else:
-                    if st.button("Open selected group details", key=f"reopen_drilldown_{_safe_key(selected_sig)}"):
-                        st.session_state.pop("drilldown_closed_signature", None)
+        if grouped_pos_df is None or grouped_pos_df.empty:
+            st.info("No open positions to show.")
+        else:
+            st.caption("Click a row in the Open Positions table to view the trade rows that make up that group.")
+            group_selection = display_custom_table(
+                f"Open Positions - {selected_preset}",
+                grouped_pos_df,
+                default_columns=grouped_default_columns,
+                default_only=True,
+                selectable=True,
+                selection_key=f"aggregated_positions_row_selection_{_safe_key(selected_preset)}_{APP_VERSION_TAG}",
+                table_key_override=f"Open Positions {selected_preset} {APP_VERSION_TAG}",
+            )
+            latest_aggregated_df = grouped_pos_df.copy()
+            _download_df_csv("Download aggregated positions CSV", grouped_pos_df, f"download_aggregated_positions_{_safe_key(selected_preset)}_{APP_VERSION_TAG}")
+
+            selected_rows = _event_selected_rows(group_selection)
+            selected_group = None
+            selected_sig = None
+            if selected_rows:
+                selected_pos = selected_rows[0]
+                if 0 <= selected_pos < len(grouped_pos_df):
+                    selected_group = grouped_pos_df.iloc[selected_pos]
+                    selected_sig = _drilldown_signature(selected_group, selected_preset)
+                    if st.session_state.get("drilldown_closed_signature") != selected_sig:
                         st.session_state["drilldown_row"] = selected_group.to_dict()
                         st.session_state["drilldown_preset"] = selected_preset
                         st.session_state["drilldown_signature"] = selected_sig
-                        st.rerun()
-        else:
-            st.info("Select an aggregated-position row to open a closeable drill-down widget with the underlying trades.")
+                    else:
+                        if st.button("Open selected group details", key=f"reopen_drilldown_{_safe_key(selected_sig)}"):
+                            st.session_state.pop("drilldown_closed_signature", None)
+                            st.session_state["drilldown_row"] = selected_group.to_dict()
+                            st.session_state["drilldown_preset"] = selected_preset
+                            st.session_state["drilldown_signature"] = selected_sig
+                            st.rerun()
+            else:
+                st.info("Select an aggregated-position row to open a closeable drill-down widget with the underlying trades.")
 
-        if st.session_state.get("drilldown_row") and st.session_state.get("drilldown_preset"):
-            selected_group = pd.Series(st.session_state["drilldown_row"])
-            selected_preset_for_drill = st.session_state["drilldown_preset"]
-            drill_sig = st.session_state.get("drilldown_signature") or _drilldown_signature(selected_group, selected_preset_for_drill)
-            open_df_for_drill = grouped_open_base_view_df
-            drill_df = _open_positions_for_group(open_df_for_drill, selected_group, selected_preset_for_drill)
-            latest_drill_df = drill_df.copy()
-            _show_drilldown_widget(drill_df, selected_group, selected_preset_for_drill, drill_sig)
+            if st.session_state.get("drilldown_row") and st.session_state.get("drilldown_preset"):
+                selected_group = pd.Series(st.session_state["drilldown_row"])
+                selected_preset_for_drill = st.session_state["drilldown_preset"]
+                drill_sig = st.session_state.get("drilldown_signature") or _drilldown_signature(selected_group, selected_preset_for_drill)
+                open_df_for_drill = grouped_open_base_view_df
+                try:
+                    drill_df = _open_positions_for_group(open_df_for_drill, selected_group, selected_preset_for_drill)
+                    drill_df = _apply_conditional_position_columns(drill_df, drop_empty_expiry=False)
+                    drill_df = _add_direction_column(drill_df, "Quantity", abs_qty=True)
+                    latest_drill_df = drill_df.copy()
+                    _show_drilldown_widget(drill_df, selected_group, selected_preset_for_drill, drill_sig)
+                except Exception as _drill_err:
+                    st.error(f"Drill-down error: {_drill_err}")
 
     with tabs[2]:
         st.caption("Trades are the row-level open trade records that make up aggregated exposure.")
@@ -1298,11 +1444,16 @@ if extracted_tables:
         # Scaffold: both clearing views show the same data for now.
         trades_filters = _render_position_search_controls(open_positions_base_view_df, "trades")
         trades_filtered_df = _apply_position_filters_to_view(open_positions_base_view_df, trades_filters)
-        trades_has_option_positions = _has_option_positions(trades_filtered_df)
-        trades_view_df = _drop_option_columns_when_no_options(trades_filtered_df, trades_has_option_positions)
-        # These columns belong to Aggregated Positions, not individual trade rows.
+        # Apply conditional column drops consistently: removes Call/Put, Delta, NOV,
+        # and blank strikePrice when no option rows are present. This also prevents
+        # stale checkbox widget state from resurfacing blank option columns.
+        trades_view_df = _apply_conditional_position_columns(trades_filtered_df, drop_empty_expiry=False)
+        trades_view_df = _add_direction_column(trades_view_df, "Quantity", abs_qty=True)
+        # These columns belong to Open Positions only, or are not applicable at
+        # individual trade level. Delta is always removed from Trades regardless of
+        # whether options are present.
         trades_view_df = trades_view_df.drop(
-            columns=["Realised PNL", "settlementPrice", "Settlement Price Time"],
+            columns=["Realised PNL", "settlementPrice", "Settlement Price Time", "Real Unrealised PNL (OTE)", "Delta"],
             errors="ignore",
         )
         latest_trades_df = trades_view_df.copy()
@@ -1319,13 +1470,13 @@ if extracted_tables:
             if fx_agg_df.empty:
                 st.info("No FX trades found. Check your filters or upload a statement with FX positions.")
             else:
-                _FX_AGG_DEFAULT_COLS = [
+                _FX_AGG_DEFAULT_COLS = _apply_master_col_order([
                     c for c in [
                         "Account Number", "Product", "Type", "CCY 1", "CCY 1 Amount",
                         "CCY 2", "CCY 2 Amount", "expiryDate", "Quantity", "Net Quantity",
                         "Unrealised PNL (OTE)", "Trade Count",
                     ] if c in fx_agg_df.columns
-                ]
+                ])
 
                 # Split screen: aggregated table on the left, drill-down on the right.
                 # Fixed height keeps both panels visible on screen simultaneously.
@@ -1411,17 +1562,20 @@ if extracted_tables:
                             f"download_fx_drill_csv_{APP_VERSION_TAG}",
                         )
         else:
-            display_custom_table(
-                "Trades",
-                trades_view_df,
-                default_columns=_open_positions_default_columns(trades_view_df),
-                default_only=True,
-                table_key_override=f"Trades {APP_VERSION_TAG}",
-            )
-            _download_df_csv("Download trades CSV", trades_view_df, f"download_trades_csv_{APP_VERSION_TAG}")
+            if trades_view_df is None or trades_view_df.empty:
+                st.info("No trades to show.")
+            else:
+                display_custom_table(
+                    "Trades",
+                    trades_view_df,
+                    default_columns=_open_positions_default_columns(trades_view_df),
+                    default_only=True,
+                    table_key_override=f"Trades {APP_VERSION_TAG}",
+                )
+                _download_df_csv("Download trades CSV", trades_view_df, f"download_trades_csv_{APP_VERSION_TAG}")
 
     with tabs[3]:
-        st.caption("Realised P&L from Purchase & Sale (Gross Profit or Loss) rows — parsed using the same column logic as Trades and aggregated using the same presets as Aggregated Positions.")
+        st.caption("Realised P&L from Purchase & Sale (Gross Profit or Loss) rows — parsed using the same column logic as Trades and aggregated using the same presets as Open Positions.")
         realised_clearing_view = _render_clearing_view_toggle("realised_pnl")
         # Scaffold: both clearing views show the same data for now.
 
@@ -1429,6 +1583,8 @@ if extracted_tables:
 
         # Trade-level view: same parsing pipeline as Trades
         realised_trade_df = closed_positions_standard_view(realised_source_tables)
+        if realised_trade_df is not None:
+            realised_trade_df = realised_trade_df.drop(columns=["Delta", "Real Unrealised PNL (OTE)"], errors="ignore")
 
         if realised_trade_df is None or realised_trade_df.empty:
             st.info("No realised P&L rows found in the uploaded statements.")
@@ -1438,11 +1594,11 @@ if extracted_tables:
             r1.metric("Realised PNL rows", f"{len(realised_trade_df):,}")
             r2.metric("Total realised PNL", f"{total_realised:,.2f}")
 
-            # Aggregation presets: same as Aggregated Positions
+            # Aggregation presets: same as Open Positions
             realised_preset_options = {
                 "Product": {"group_cols": ["product", "exchange"], "mode": "custom"},
                 "Contract": {"group_cols": None, "mode": "auto_futures_options"},
-                "Account Grouping": {"group_cols": ["account_number", "product", "ref_month", "trigger_barrier", "option_type", "strike"], "mode": "custom"},
+                "Account": {"group_cols": ["account_number", "product", "ref_month", "trigger_barrier", "option_type", "strike"], "mode": "custom"},
             }
             selected_realised_preset = st.radio(
                 "Realised PNL view",
@@ -1452,38 +1608,164 @@ if extracted_tables:
             )
             realised_preset = realised_preset_options[selected_realised_preset]
 
-            # Aggregated view: same grouping rules as Aggregated Positions
+            # Aggregated view: same grouping rules as Open Positions
             realised_grouped_df = grouped_realized_pnl_view(
                 realised_source_tables,
                 realised_preset["group_cols"],
                 mode=realised_preset.get("mode", "custom"),
             )
+            # Drop columns that belong to Open Positions only or are not applicable
+            # in a realised P&L view. Delta is always removed. Settlement Price and
+            # Settlement Price Time are Open Positions-only.
+            realised_grouped_df = realised_grouped_df.drop(
+                columns=["Delta", "settlementPrice", "Settlement Price Time"],
+                errors="ignore",
+            )
+            # Direction for Realised PNL: add via the standard helper.
+            realised_grouped_df = _add_direction_column(realised_grouped_df, "Net Quantity")
 
-            # Same column order as Aggregated Positions, with "Realised PNL" in place of
-            # "Unrealised PNL (OTE)" and an extra "Debit/Credit" column.
-            _realised_grouped_default_cols = [c for c in (
-                [col for col in GROUPED_POSITION_COLUMNS if col != "Unrealised PNL (OTE)"]
-                + ["Realised PNL", "Debit/Credit"]
-            ) if c in realised_grouped_df.columns]
+            # ── Default column visibility — mirrors Open Positions exactly ───────
+            _r_cols = set(realised_grouped_df.columns)
+            _r_has_options = (
+                "Call/Put" in _r_cols
+                and realised_grouped_df["Call/Put"].notna().any()
+                and realised_grouped_df["Call/Put"].astype(str).str.strip().ne("").any()
+            )
+            _r_has_accumulators = "Trigger/Barrier" in _r_cols
 
-            display_custom_table(
+            # Columns always excluded from defaults (same rules as Open Positions, plus
+            # closed-position-specific removals).
+            _r_preset_exclude = {
+                "CCY 1", "CCY 1 Amount", "CCY 2", "CCY 2 Amount",
+                "Last Update Time", "Entry Time",
+                "Unrealised PNL (OTE)", "Real Unrealised PNL (OTE)",
+                "Delta", "settlementPrice", "Settlement Price Time", "NOV",
+            }
+            # Product preset: same rules as Open Positions
+            if selected_realised_preset == "Product":
+                _r_preset_exclude.update({"Contract", "Currency"})
+                if not _r_has_options and not _r_has_accumulators:
+                    _r_preset_exclude.add("expiryDate")
+
+            # FX / accumulator Exchange-hiding — same rule as Open Positions
+            if "Type" in realised_grouped_df.columns:
+                _r_type_vals = realised_grouped_df["Type"].dropna().astype(str).str.strip().str.upper()
+                _r_type_clean = _r_type_vals[_r_type_vals.str.lower().ne("multiple") & _r_type_vals.ne("")]
+                _r_all_fx = (_r_type_clean.str.startswith("FX").all() | _r_type_clean.isin(["NDO"]).all()) if not _r_type_clean.empty else False
+                _r_has_fx  = _r_type_clean.str.startswith("FX").any() | _r_type_clean.isin(["NDO"]).any()
+            else:
+                _r_all_fx = _r_has_fx = False
+            if _r_has_fx or _r_has_accumulators:
+                _r_preset_exclude.add("Exchange")
+            if _r_all_fx and selected_realised_preset != "Product":
+                _r_preset_exclude.add("Currency")
+
+            _r_force_include = set()
+            if selected_realised_preset in {"Contract", "Account"}:
+                _r_force_include.add("expiryDate")
+            if _r_has_accumulators:
+                _r_force_include.update({"Trigger/Barrier", "expiryDate"})
+
+            # Column ORDER: GROUPED_POSITION_COLUMNS with PNL column substitutions.
+            _REALISED_COL_ORDER = [
+                "Realised PNL" if c == "Unrealised PNL (OTE)" else c
+                for c in GROUPED_POSITION_COLUMNS
+            ] + ["Debit/Credit"]
+
+            _realised_grouped_default_cols = _apply_master_col_order([
+                c for c in _REALISED_COL_ORDER
+                if c != "Type"
+                and c not in _r_preset_exclude
+                and (c in _r_cols or c in _r_force_include)
+            ])
+
+            realised_group_selection = display_custom_table(
                 f"Realised PNL — {selected_realised_preset}",
                 realised_grouped_df,
                 default_columns=_realised_grouped_default_cols,
                 default_only=True,
+                selectable=True,
+                selection_key=f"realised_pnl_row_selection_{_safe_key(selected_realised_preset)}_{APP_VERSION_TAG}",
                 table_key_override=f"Realised PNL {selected_realised_preset} {APP_VERSION_TAG}",
             )
             _download_df_csv("Download realised PNL CSV", realised_grouped_df, f"download_realised_pnl_csv_{APP_VERSION_TAG}")
 
+            # ── Drill-down: only show after user explicitly clicks a row ─────────
+            realised_selected_rows = _event_selected_rows(realised_group_selection)
+            if realised_selected_rows:
+                sel_pos = realised_selected_rows[0]
+                if 0 <= sel_pos < len(realised_grouped_df):
+                    _sel = realised_grouped_df.iloc[sel_pos]
+                    st.session_state["realised_drilldown_row"] = _sel.to_dict()
+                    st.session_state["realised_drilldown_preset"] = selected_realised_preset
+            else:
+                # No active selection — clear stale state so the panel doesn't
+                # persist from a previous click or a different preset/upload.
+                st.session_state.pop("realised_drilldown_row", None)
+                st.session_state.pop("realised_drilldown_preset", None)
+
+            if st.session_state.get("realised_drilldown_row"):
+                _rsel = pd.Series(st.session_state["realised_drilldown_row"])
+                _rpreset = st.session_state.get("realised_drilldown_preset", selected_realised_preset)
+
+                # Use the already-computed detail df and the dedicated filter that
+                # matches on Product/Exchange/Contract — not on expiryDate, which is
+                # only set on Net P&L summary rows (Trade rows have no close_date).
+                if realised_trade_df is not None and not realised_trade_df.empty:
+                    _realised_drill_df = _realised_trades_for_group(realised_trade_df, _rsel, _rpreset)
+                    _realised_drill_df = _apply_conditional_position_columns(_realised_drill_df, drop_empty_expiry=False)
+
+                    st.markdown("---")
+                    st.subheader("Trade Detail")
+                    st.caption(_selected_group_description(_rsel, _rpreset))
+
+                    # Derive Direction from Long/Short for each trade row, then drop
+                    # raw Long/Short — Direction is cleaner for the end user.
+                    if "Long" in _realised_drill_df.columns or "Short" in _realised_drill_df.columns:
+                        _long  = pd.to_numeric(_realised_drill_df.get("Long"),  errors="coerce")
+                        _short = pd.to_numeric(_realised_drill_df.get("Short"), errors="coerce")
+                        _realised_drill_df = _realised_drill_df.copy()
+                        _realised_drill_df["Direction"] = _long.notna().map(
+                            {True: "Long", False: ""}
+                        ).where(_long.notna(), _short.notna().map({True: "Short", False: ""}))
+                        _realised_drill_df = _realised_drill_df.drop(columns=["Long", "Short"], errors="ignore")
+
+                    # Rename to match Open Positions Trade Detail column names exactly.
+                    _realised_drill_df = _realised_drill_df.rename(columns={
+                        "Net Quantity": "Quantity",
+                        "Avg Fill Price": "Trade Price",
+                    })
+                    # Drop internal/technical columns not relevant to end users.
+                    _realised_drill_df = _realised_drill_df.drop(
+                        columns=["Row Type", "source_section"], errors="ignore"
+                    )
+
+                    # Use the same shared column definition as Open Positions drill-down
+                    # so both Trade Detail views show columns in an identical order.
+                    _realised_drill_default_cols = _trade_detail_default_columns(_realised_drill_df)
+                    display_custom_table(
+                        "Realised PNL Trade Detail",
+                        _realised_drill_df,
+                        default_columns=_realised_drill_default_cols,
+                        default_only=False,
+                        table_key_override=f"Realised PNL Drill {APP_VERSION_TAG}",
+                    )
+                    _download_df_csv("Download trade detail CSV", _realised_drill_df, f"download_realised_drill_csv_{APP_VERSION_TAG}")
+                    if st.button("Clear selection", key=f"clear_realised_drilldown_{APP_VERSION_TAG}"):
+                        st.session_state.pop("realised_drilldown_row", None)
+                        st.session_state.pop("realised_drilldown_preset", None)
+                        st.rerun()
+
     with tabs[4]:
-        st.caption("This section shows the trade-level rows behind the last selected Aggregated Positions row.")
+        st.caption("This section shows the trade-level rows behind the last selected Open Positions row.")
         if st.session_state.get("drilldown_row") and st.session_state.get("drilldown_preset"):
             selected_group = pd.Series(st.session_state["drilldown_row"])
             selected_preset_for_drill = st.session_state["drilldown_preset"]
             filters_for_drill = st.session_state.get("last_aggregated_filters", {})
             drill_source = _apply_position_filters_to_view(open_positions_base_view_df, filters_for_drill)
             drill_df = _open_positions_for_group(drill_source, selected_group, selected_preset_for_drill)
-            drill_df = _drop_option_columns_when_no_options(drill_df, _has_option_positions(drill_source))
+            drill_df = _apply_conditional_position_columns(drill_df, drop_empty_expiry=False)
+            drill_df = _add_direction_column(drill_df, "Quantity")
             latest_drill_df = drill_df.copy()
             st.subheader("Selected group")
             st.caption(_selected_group_description(selected_group, selected_preset_for_drill))
@@ -1499,7 +1781,7 @@ if extracted_tables:
                 _close_drilldown()
                 st.rerun()
         else:
-            st.info("Select a row in Aggregated Positions to see the underlying trades here.")
+            st.info("Select a row in Open Positions to see the underlying trades here.")
 
     with tabs[5]:
         st.caption("Review parser/data-quality issues and completeness checks.")
@@ -1518,13 +1800,16 @@ if extracted_tables:
 
     with tabs[6]:
         st.caption("Download full or view-specific outputs.")
-        st.download_button(
-            "Download merged Excel",
-            data=merged_excel,
-            file_name="stonex_merged_trades_positions.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            key=f"download_merged_{APP_VERSION_TAG}",
-        )
+        if merged_excel:
+            st.download_button(
+                "Download merged Excel",
+                data=merged_excel,
+                file_name="stonex_merged_trades_positions.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key=f"download_merged_{APP_VERSION_TAG}",
+            )
+        else:
+            st.button("Download merged Excel", disabled=True, key=f"download_merged_{APP_VERSION_TAG}")
         st.markdown("**View exports**")
         export_cols = st.columns(3)
         with export_cols[0]:
@@ -1539,13 +1824,21 @@ if extracted_tables:
         if source == "PDF upload":
             with st.expander("Per-file exports"):
                 for idx, (uploaded, tables) in enumerate(zip(uploaded_files, extracted_tables), start=1):
-                    st.download_button(
-                        f"Download Excel for {uploaded.name}",
-                        data=to_excel_bytes(tables),
-                        file_name=uploaded.name.rsplit(".", 1)[0] + "_trades.xlsx",
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                        key=f"download_{idx}_{uploaded.name}_{APP_VERSION_TAG}",
-                    )
+                    try:
+                        _per_file_excel = to_excel_bytes(tables)
+                    except Exception as _xlsx_err:
+                        _per_file_excel = b""
+                        st.warning(f"Excel export failed for {uploaded.name}: {_xlsx_err}")
+                    if _per_file_excel:
+                        st.download_button(
+                            f"Download Excel for {uploaded.name}",
+                            data=_per_file_excel,
+                            file_name=uploaded.name.rsplit(".", 1)[0] + "_trades.xlsx",
+                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                            key=f"download_{idx}_{uploaded.name}_{APP_VERSION_TAG}",
+                        )
+                    else:
+                        st.button(f"Download Excel for {uploaded.name}", disabled=True, key=f"download_{idx}_{uploaded.name}_{APP_VERSION_TAG}")
 
 
 else:
@@ -1558,7 +1851,7 @@ else:
         """
         This prototype is organized around five working sections after upload:
 
-        - **Aggregated Positions** for exposure-level views.
+        - **Open Positions** for exposure-level views.
         - **Trades** for row-level trade records.
         - **Position Details / Drill-down** for the trades behind a selected aggregate.
         - **Exceptions / Data Quality** for completeness checks.

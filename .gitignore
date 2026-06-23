@@ -29,3 +29,6 @@ Thumbs.db
 
 # Runtime user data — saved views are per-user/local state
 saved_views.json
+
+# Local run log
+streamlit.log

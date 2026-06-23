@@ -3350,6 +3350,24 @@ def extract(pdf_bytes: bytes, include_open_positions: bool = True) -> Dict[str, 
                             row["source_line"] = f"{line} | {next_line}"
                             i += 1
                     if section == "purchase_sale":
+                        # Detect LONG vs SHORT from raw character position.
+                        # The P&S table has the same fixed-width layout as Open Positions:
+                        # LONG column starts near col 25, SHORT near col 39.
+                        # qty_start >= 34 → SHORT leg; else LONG leg.
+                        ps_qty_match = re.search(
+                            r"^\s*\d{1,2}/\d{2}/\d\s+(?:[A-Z0-9]+\s+)?[A-Z]\d\s+(?P<qty>\d[\d,]*)\s+",
+                            raw,
+                        )
+                        if ps_qty_match:
+                            qty_val = row.get("quantity")
+                            if ps_qty_match.start("qty") >= 34:
+                                row["side"]  = "Short"
+                                row["short"] = qty_val
+                                row["long"]  = None
+                            else:
+                                row["side"]  = "Long"
+                                row["long"]  = qty_val
+                                row["short"] = None
                         parsed_contract = parse_contract_product(row.get("contract_description"))
                         for meta_col, meta_val in parsed_contract.items():
                             row.setdefault(meta_col, meta_val)
@@ -3993,7 +4011,7 @@ def _ensure_fx_position_columns(df: pd.DataFrame) -> pd.DataFrame:
     # - options: true Expiration Date from the option summary lines
     # - FX: Value Date from the FX OPEN POSITIONS header
     # - futures/forwards/LME: Delivery date from Delivery / Product
-    # This lets Product + Contract Month/Year and Account Grouping use the actual
+    # This lets Product + Contract Month/Year and Account use the actual
     # date when the statement provides one, while Product grouping stays product-only.
     out = _fill_missing_from_candidates(
         out,
@@ -4031,7 +4049,7 @@ def _series_nonblank(series: pd.Series) -> pd.Series:
 def _add_expiry_or_ref_group_key(df: pd.DataFrame) -> pd.DataFrame:
     """Use true expiry/value date as the month grouping key when available.
 
-    Product + Contract Month/Year and Account Grouping still display
+    Product + Contract Month/Year and Account still display
     Contract Month/Year, but rows with an actual expiryDate/value date group
     by that date so different expiries do not collapse together.
     """
@@ -4077,7 +4095,7 @@ def _fx_group_cols_for_base(group_cols: list[str] | None, mode: str = "custom") 
     """Return FX grouping keys for the selected grouped-position view.
 
     Product grouping remains a product-level summary. Product + Contract
-    Month/Year and Account Grouping keep FX option/NDO economics by adding
+    Month/Year and Account keep FX option/NDO economics by adding
     Call/Put and strike to the key. Plain FX forwards/spots/swaps have those
     fields blank, so they continue grouping by product/expiry only.
 
@@ -4259,7 +4277,7 @@ STANDARD_POSITION_COLUMNS = [
     "Account Number",
     "Broker Code",
     "Net Quantity",
-    "Last Update",
+    "Last Update Time",
     "Contract",
     "Trade Price",
     "Avg Fill Price",
@@ -4272,6 +4290,7 @@ STANDARD_POSITION_COLUMNS = [
     "Real Unrealised PNL (OTE)",
     "Realised PNL",
     "Market Value",
+    "Entry Time",
 ]
 
 
@@ -4293,6 +4312,7 @@ OPEN_POSITION_COLUMNS = [
     "CCY 2 Amount",
     "Account Number",
     "Broker Code",
+    "Direction",
     "Quantity",
     "expiryDate",
     "Contract",
@@ -4301,6 +4321,7 @@ OPEN_POSITION_COLUMNS = [
     "Settlement Price Time",
     "Call/Put",
     "strikePrice",
+    "Entry Time",
 ]
 
 GROUPED_POSITION_COLUMNS = [
@@ -4319,12 +4340,15 @@ GROUPED_POSITION_COLUMNS = [
     "strikePrice",
     "Delta",
     "Account Number",
+    "Direction",
     "Net Quantity",
     "Avg Fill Price",
     "settlementPrice",
     "Settlement Price Time",
     "NOV",
     "Unrealised PNL (OTE)",
+    "Last Update Time",
+    "Entry Time",
 ]
 
 
@@ -5054,7 +5078,7 @@ def standard_position_view_from_df(df: pd.DataFrame) -> pd.DataFrame:
         "Account Number": account_number,
         "Broker Code": broker_code,
         "Net Quantity": net_qty,
-        "Last Update": last_update,
+        "Last Update Time": last_update,
         "Settlement Date": settlement_date,
         "Contract": month_year,
         "Trade Price": trade_price,
@@ -5070,6 +5094,8 @@ def standard_position_view_from_df(df: pd.DataFrame) -> pd.DataFrame:
         "Real Unrealised PNL (OTE)": None,
         "Realised PNL": realised_pnl,
         "Market Value": market_value_display,
+        # Placeholder — to be populated when entry time is parsed from statements.
+        "Entry Time": None,
     })
     out = _apply_trade_level_nov_ote_split(out)
     if "Avg Fill Price" in out.columns:
@@ -5252,10 +5278,10 @@ def add_grouped_position_pnl_columns(grouped_df: pd.DataFrame, tables: Dict[str,
 def prepare_grouped_positions_display(grouped_df: pd.DataFrame, tables: Dict[str, pd.DataFrame] | None = None, selected_preset: str | None = None, drop_option_columns: bool = False) -> pd.DataFrame:
     """Apply final grouped-position layout rules used by the Streamlit app and Excel export.
 
-    Account Number is intentionally shown only in the Account Grouping view.
+    Account Number is intentionally shown only in the Account view.
     Product-only and Product + Contract Month/Year are market/risk views, so
     account details are removed from those grouped summaries while remaining
-    available in Open Positions and in Account Grouping drill-down.
+    available in Open Positions and in Account drill-down.
     """
     if grouped_df is None or grouped_df.empty:
         return grouped_df
@@ -5272,7 +5298,7 @@ def prepare_grouped_positions_display(grouped_df: pd.DataFrame, tables: Dict[str
         "Trade Price", "Ref Price", "Original Quantity",
         # These survive from STANDARD_POSITION_COLUMNS but are trade-level noise in a grouped view:
         "Global ID", "End Date", "Trade Date",
-        "Broker Code", "Last Update", "sourceSystem",
+        "Broker Code", "Last Update Time", "sourceSystem",
     ], errors="ignore")
 
     if preset in {"Product", "Product + Contract Month/Year"}:
@@ -5603,12 +5629,19 @@ def closed_positions_standard_view(tables: Dict[str, pd.DataFrame]) -> pd.DataFr
     long_qty  = pd.to_numeric(_first_existing(src, ["long"]),     errors="coerce")
     short_qty = pd.to_numeric(_first_existing(src, ["short"]),    errors="coerce")
     is_net_row = row_type == "Net P&L"
-    # Net Quantity: for Net P&L rows show Long (total contracts closed); for Trade rows show
-    # the individual leg quantity.
-    out["Net Quantity"]         = long_qty.where(is_net_row, trade_qty)
+
+    # Net Quantity:
+    #   Net P&L rows — use the pre-computed `quantity` field (= long − short = 0 for a
+    #     fully closed position).
+    #   Trade rows — use the raw unsigned quantity (Long/Short columns convey direction).
+    #     Signed quantities are not needed here because grouped_realized_pnl_view zeroes
+    #     out Trade-row Net Quantities before aggregation and reads only Net P&L rows.
+    out["Net Quantity"]         = trade_qty
     # Keep Long/Short separately so users can cross-check.
-    out["Long"]                 = long_qty.where(is_net_row, None)
-    out["Short"]                = short_qty.where(is_net_row, None)
+    # Expose values for both Trade rows and Net P&L rows — Trade rows need them for the
+    # drill-down detail view so the user can see which leg was Long vs Short.
+    out["Long"]                 = long_qty
+    out["Short"]                = short_qty
 
     close_price = pd.to_numeric(
         _first_existing(src, ["close_price", "trade_price", "price"]), errors="coerce"
@@ -5655,6 +5688,15 @@ def grouped_realized_pnl_view(
     df = closed_positions_standard_view(tables)
     if df is None or df.empty:
         return pd.DataFrame()
+
+    # Net Quantity aggregation must only use "Net P&L" rows (GROSS PROFIT OR LOSS summary
+    # lines). These carry quantity = long − short, which is 0 for fully closed positions.
+    # Individual P&S trade rows carry unsigned quantities regardless of LONG/SHORT side
+    # (column position is not reliably preserved by PDF text extractors), so including
+    # them in the sum produces incorrect totals. Zero them out before grouping.
+    if "Row Type" in df.columns and "Net Quantity" in df.columns:
+        df = df.copy()
+        df.loc[df["Row Type"] != "Net P&L", "Net Quantity"] = 0
 
     display_group_col_map = {
         "product":        "Product",
@@ -5790,10 +5832,10 @@ def to_excel_bytes(tables: Dict[str, pd.DataFrame]) -> bytes:
     output = io.BytesIO()
     ordered = {
         "Summary": tables.get("Summary", pd.DataFrame()),
-        "Aggregated Positions": prepare_grouped_positions_display(
+        "Open Positions": prepare_grouped_positions_display(
             grouped_positions_product_month_auto_standard_view(tables),
             tables=tables,
-            selected_preset="Product + Contract Month/Year",
+            selected_preset="Contract",
             drop_option_columns=False,
         ),
         "Realized PNL": realized_pnl_summary(tables),
@@ -5821,4 +5863,4 @@ def to_excel_bytes(tables: Dict[str, pd.DataFrame]) -> bytes:
                 cell.font = Font(bold=True, color="FFFFFF")
                 cell.fill = PatternFill("solid", fgColor="4F81BD")
                 cell.alignment = Alignment(horizontal="center")
-        
+    return output.getvalue()

@@ -5,6 +5,7 @@ import pandas as pd
 import html
 
 import data_source as ds
+import saved_views as sv
 from parser import (
     extract,
     to_excel_bytes,
@@ -27,8 +28,46 @@ APP_VERSION_TAG = "v95"
 APP_VERSION_DESCRIPTION = "Remove ccy_1/ccy_2 from FX grouping keys — Product name already encodes the CCY pair"
 
 st.set_page_config(page_title="MyStoneX Positions", layout="wide")
+
 st.title("MyStoneX Positions")
 st.caption(f"Upload one or more StoneX statement PDFs, merge trades, review aggregated positions, drill into details, and export. Version: {APP_VERSION_TAG} {APP_VERSION_DESCRIPTION}.")
+
+# ── Saved-view helpers ────────────────────────────────────────────────────────
+
+# Key bases (version tag stripped) that form a saved view snapshot.
+_FILTER_PREFIXES = ["aggregated_positions", "trades"]
+_FILTER_SUFFIXES = [
+    "account_search", "exchange_filter", "type_filter", "product_filter",
+    "currency_filter", "date_enabled", "date_field", "date_from", "date_to",
+    "broker_search",
+]
+_PRESET_KEY_BASES = [
+    "aggregated_positions_preset_view",
+    "realised_pnl_preset",
+    "trade_view_mode",
+]
+
+
+def _capture_view_state() -> dict:
+    """Snapshot current filter/preset/column state (version tag stripped from keys)."""
+    state = {}
+    for prefix in _FILTER_PREFIXES:
+        for suffix in _FILTER_SUFFIXES:
+            full_key = f"{prefix}_{suffix}_{APP_VERSION_TAG}"
+            if full_key in st.session_state:
+                state[f"{prefix}_{suffix}"] = st.session_state[full_key]
+    for base in _PRESET_KEY_BASES:
+        full_key = f"{base}_{APP_VERSION_TAG}"
+        if full_key in st.session_state:
+            state[base] = st.session_state[full_key]
+    # Column visibility keys have no version tag
+    for key, value in st.session_state.items():
+        if key.startswith("selected_cols_"):
+            state[key] = value
+    return state
+
+
+
 
 with st.sidebar:
     st.header("Options")
@@ -46,6 +85,61 @@ with st.sidebar:
     st.markdown("---")
     st.subheader("Column display")
     st.caption("After upload, use the Customize table button above each table to show/hide columns.")
+    st.markdown("---")
+    st.subheader("Saved Views")
+    _all_views = sv.load_all()
+    _view_names = list(_all_views.keys())
+
+    if _view_names:
+        _selected_view = st.selectbox(
+            "Saved views",
+            options=_view_names,
+            label_visibility="collapsed",
+            key=f"saved_view_selector_{APP_VERSION_TAG}",
+        )
+        _btn_load, _btn_update = st.columns(2)
+        if _btn_load.button("Load", use_container_width=True, key=f"load_view_btn_{APP_VERSION_TAG}"):
+            # Apply saved state directly — the sidebar runs before filter widgets,
+            # so values set here are picked up by widgets later in the same run.
+            _view_to_load = _all_views.get(_selected_view, {})
+            for _kb, _kv in _view_to_load.items():
+                if _kb.startswith("selected_cols_"):
+                    st.session_state[_kb] = _kv
+                else:
+                    st.session_state[f"{_kb}_{APP_VERSION_TAG}"] = _kv
+            st.toast(f"View \"{_selected_view}\" loaded.", icon="✅")
+
+        if _btn_update.button("Update", use_container_width=True, key=f"update_view_btn_{APP_VERSION_TAG}",
+                              help="Overwrite this view with your current filters and settings"):
+            sv.save_view(_selected_view, _capture_view_state())
+            st.toast(f"View \"{_selected_view}\" updated.", icon="✅")
+
+        if st.button(
+            f"Delete \"{_selected_view}\"",
+            use_container_width=True,
+            key=f"delete_view_btn_{APP_VERSION_TAG}",
+        ):
+            sv.delete_view(_selected_view)
+            st.rerun()
+    else:
+        st.caption("No saved views yet.")
+
+    with st.expander("Save as new view"):
+        _view_name_input = st.text_input(
+            "View name",
+            placeholder="e.g. BRL FX open positions",
+            key=f"save_view_name_{APP_VERSION_TAG}",
+        )
+        if st.button(
+            "Save view",
+            disabled=not (_view_name_input or "").strip(),
+            use_container_width=True,
+            key=f"save_view_btn_{APP_VERSION_TAG}",
+        ):
+            sv.save_view(_view_name_input.strip(), _capture_view_state())
+            st.toast(f"View \"{_view_name_input.strip()}\" saved.", icon="✅")
+            st.rerun()
+
     st.markdown("---")
     st.caption("Tip: use filters and aggregation views to reconcile trade-level rows back to position exposure.")
 
@@ -430,6 +524,27 @@ def _clean_filter_values(series):
     return sorted(set(vals), key=lambda x: x.upper())
 
 
+# Cleared vs Real Time view switch. Currently scaffolding: both options render the
+# same data. When the cleared-vs-real-time row classification is defined, branch on
+# the returned value — "Cleared View" filters to cleared rows, "Real Time + Cleared
+# View" includes everything.
+CLEARING_VIEW_OPTIONS = ["Cleared View", "Real Time + Cleared View"]
+
+
+def _render_clearing_view_toggle(key_prefix):
+    """Render the Cleared / Real Time + Cleared view dropdown and return the selection.
+
+    Scaffold only: both views currently show identical data. Defaults to
+    "Cleared View".
+    """
+    return st.selectbox(
+        "Clearing view",
+        options=CLEARING_VIEW_OPTIONS,
+        index=0,
+        key=f"clearing_view_{key_prefix}_{APP_VERSION_TAG}",
+    )
+
+
 def _render_position_search_controls(base_view_df, key_prefix):
     """Render account/product/type/exchange/currency/date filters for Trades and Aggregated Positions.
 
@@ -787,7 +902,7 @@ def _apply_contract_or_expiry_drill_filter(mask, df, row):
     expiry = row.get("expiryDate") if hasattr(row, "get") else None
     if not _is_blank_drill_value(expiry) and "expiryDate" in df.columns:
         return _apply_text_filter(mask, df, "expiryDate", expiry)
-    return _apply_text_filter(mask, df, "Contract Month/Year", row.get("Contract Month/Year"))
+    return _apply_text_filter(mask, df, "Contract", row.get("Contract"))
 
 def _open_positions_for_group(open_df, selected_group_row, selected_preset):
     """Filter trade rows to the rows that make up a selected aggregated row."""
@@ -822,8 +937,8 @@ def _open_positions_for_group(open_df, selected_group_row, selected_preset):
             if "strikePrice" in df.columns:
                 mask = mask & _blank_series_mask(df["strikePrice"])
     else:
-        # Product + Contract Month/Year view. If expiryDate is present, the group is expiry-aware;
-        # otherwise it falls back to Product + Contract Month/Year.
+        # Contract view. If expiryDate is present, the group is expiry-aware;
+        # otherwise it falls back to Contract.
         mask = _apply_contract_or_expiry_drill_filter(mask, df, row)
         mask = _apply_text_filter(mask, df, "Trigger/Barrier", row.get("Trigger/Barrier"))
         call_put = row.get("Call/Put")
@@ -847,7 +962,7 @@ def _selected_group_description(selected_group_row, selected_preset):
     if selected_group_row is None:
         return ""
     parts = []
-    for col in ["Account Number", "Product", "Type", "Contract Month/Year", "expiryDate", "Trigger/Barrier", "CCY 1", "CCY 2", "Call/Put", "strikePrice"]:
+    for col in ["Account Number", "Product", "Type", "Contract", "expiryDate", "Trigger/Barrier", "CCY 1", "CCY 2", "Call/Put", "strikePrice"]:
         if col in selected_group_row.index and not _is_blank_drill_value(selected_group_row.get(col)):
             parts.append(f"{col}: {selected_group_row.get(col)}")
     return f"{selected_preset} — " + ", ".join(parts) if parts else selected_preset
@@ -857,7 +972,7 @@ def _drilldown_signature(selected_group_row, selected_preset):
     if selected_group_row is None:
         return None
     pieces = [str(selected_preset)]
-    for col in ["Account Number", "Product", "Type", "Contract Month/Year", "expiryDate", "Trigger/Barrier", "CCY 1", "CCY 2", "Call/Put", "strikePrice"]:
+    for col in ["Account Number", "Product", "Type", "Contract", "expiryDate", "Trigger/Barrier", "CCY 1", "CCY 2", "Call/Put", "strikePrice"]:
         value = selected_group_row.get(col) if hasattr(selected_group_row, "get") else None
         pieces.append(f"{col}={'' if _is_blank_drill_value(value) else str(value).strip()}")
     return "|".join(pieces)
@@ -1018,13 +1133,15 @@ if extracted_tables:
 
     with tabs[1]:
         st.caption("Choose an aggregation view. Filters apply before aggregation, so account/type/exchange/currency/date filters work even when those columns are hidden in the selected view.")
+        aggregated_clearing_view = _render_clearing_view_toggle("aggregated_positions")
+        # Scaffold: both clearing views show the same data for now.
         grouping_presets = {
             "Product": {
                 "description": "One row per product and exchange, across all accounts, contract months, expiry dates, strikes, and trade prices.",
                 "mode": "custom",
                 "group_cols": ["product", "exchange"],
             },
-            "Product + Contract Month/Year": {
+            "Contract": {
                 "description": "Risk view by product and expiry/value/end date when available, otherwise contract month/year. OTC rows keep Trigger/Barrier when available; options also keep Call/Put + Strike Price.",
                 "mode": "auto_futures_options",
                 "group_cols": None,
@@ -1064,7 +1181,7 @@ if extracted_tables:
         )
         if "Call/Put" not in grouped_pos_df.columns:
             st.caption("No option rows detected, so Call/Put and strikePrice are hidden from position views.")
-        if selected_preset in {"Product", "Product + Contract Month/Year"}:
+        if selected_preset in {"Product", "Contract"}:
             grouped_pos_df = grouped_pos_df.drop(columns=["Account Number"], errors="ignore")
         # Pre-selected columns: use conditional logic to check only relevant columns by default.
         # The picker always shows ALL GROUPED_POSITION_COLUMNS (ensured by prepare_grouped_positions_display).
@@ -1077,18 +1194,20 @@ if extracted_tables:
         # Exception: expiryDate is kept for options (strike/expiry pair) and accumulators.
         # Currency is also excluded from the Product preset for all asset classes — it is a
         # low-level field not useful at product-level aggregation.
-        _preset_exclude = {"Contract Month/Year", "settlementPrice", "Currency"} if selected_preset == "Product" else set()
+        # Settlement Price Time mirrors settlementPrice visibility everywhere.
+        _preset_exclude = {"Contract", "settlementPrice", "Settlement Price Time", "Currency"} if selected_preset == "Product" else set()
         if selected_preset == "Product" and not _grouped_has_options and not _grouped_has_accumulators:
             _preset_exclude.add("expiryDate")
 
         # CCY 1/2 and their amounts are removed from the Aggregated Positions table
         # in all views — they are trade-level FX detail and not useful in a grouped
         # summary regardless of whether the view is purely FX or mixed.
+        # Realised PNL belongs only to the Realised PNL tab.
         grouped_pos_df = grouped_pos_df.drop(
-            columns=["CCY 1", "CCY 1 Amount", "CCY 2", "CCY 2 Amount"],
+            columns=["CCY 1", "CCY 1 Amount", "CCY 2", "CCY 2 Amount", "Realised PNL"],
             errors="ignore",
         )
-        _preset_exclude.update({"CCY 1", "CCY 1 Amount", "CCY 2", "CCY 2 Amount"})
+        _preset_exclude.update({"CCY 1", "CCY 1 Amount", "CCY 2", "CCY 2 Amount", "Realised PNL"})
 
         # Detect FX and OTC/Accumulator presence in the view.
         if "Type" in grouped_pos_df.columns:
@@ -1113,11 +1232,11 @@ if extracted_tables:
         if _all_fx and selected_preset != "Product":
             _preset_exclude.add("Currency")
 
-        # expiryDate IS a grouping key for Product + Contract Month/Year and Account Grouping
+        # expiryDate IS a grouping key for Contract and Account Grouping
         # (replaces ref_month when available; explicit key for FX rows) — always force-include.
         # Trigger/Barrier is a grouping key when accumulators are present — always force-include.
         _force_include = set()
-        if selected_preset in {"Product + Contract Month/Year", "Account Grouping"}:
+        if selected_preset in {"Contract", "Account Grouping"}:
             _force_include.add("expiryDate")
         if _grouped_has_accumulators:
             _force_include.update({"Trigger/Barrier", "expiryDate"})
@@ -1175,10 +1294,17 @@ if extracted_tables:
 
     with tabs[2]:
         st.caption("Trades are the row-level open trade records that make up aggregated exposure.")
+        trades_clearing_view = _render_clearing_view_toggle("trades")
+        # Scaffold: both clearing views show the same data for now.
         trades_filters = _render_position_search_controls(open_positions_base_view_df, "trades")
         trades_filtered_df = _apply_position_filters_to_view(open_positions_base_view_df, trades_filters)
         trades_has_option_positions = _has_option_positions(trades_filtered_df)
         trades_view_df = _drop_option_columns_when_no_options(trades_filtered_df, trades_has_option_positions)
+        # These columns belong to Aggregated Positions, not individual trade rows.
+        trades_view_df = trades_view_df.drop(
+            columns=["Realised PNL", "settlementPrice", "Settlement Price Time"],
+            errors="ignore",
+        )
         latest_trades_df = trades_view_df.copy()
 
         trade_view_mode = st.radio(
@@ -1296,6 +1422,8 @@ if extracted_tables:
 
     with tabs[3]:
         st.caption("Realised P&L from Purchase & Sale (Gross Profit or Loss) rows — parsed using the same column logic as Trades and aggregated using the same presets as Aggregated Positions.")
+        realised_clearing_view = _render_clearing_view_toggle("realised_pnl")
+        # Scaffold: both clearing views show the same data for now.
 
         realised_source_tables = merged_tables
 
@@ -1313,7 +1441,7 @@ if extracted_tables:
             # Aggregation presets: same as Aggregated Positions
             realised_preset_options = {
                 "Product": {"group_cols": ["product", "exchange"], "mode": "custom"},
-                "Product + Contract Month/Year": {"group_cols": None, "mode": "auto_futures_options"},
+                "Contract": {"group_cols": None, "mode": "auto_futures_options"},
                 "Account Grouping": {"group_cols": ["account_number", "product", "ref_month", "trigger_barrier", "option_type", "strike"], "mode": "custom"},
             }
             selected_realised_preset = st.radio(

@@ -20,3 +20,12 @@ dist/
 .idea/
 .DS_Store
 Thumbs.db
+
+# Claude Code local config
+.claude/
+
+# Statement PDFs (data; may contain sensitive account info)
+*.pdf
+
+# Runtime user data — saved views are per-user/local state
+saved_views.json

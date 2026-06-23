@@ -1374,11 +1374,11 @@ def extract_murex_statement(pdf_bytes: bytes, include_open_positions: bool = Tru
         col_ranges_open: Dict[str, tuple] = {}
         header_keys: list[float] = []
 
-        # Header row of the FX Option NDO section, when present. The dedicated
-        # NDO parser handles those rows; the commodity column extractor would
-        # mis-read them, so we use this key as an upper bound for the commodity
-        # open-positions section instead.
+        # Header row of the FX Option NDO section, when present.
         fx_option_header_key: float | None = None
+        # Header row of the FX Swap/NDF section (CCY1/CCY2 columns), when present.
+        col_ranges_fx: Dict[str, tuple] = {}
+        fx_swap_header_key: float | None = None
 
         for key, items, line in rows:
             lc = ' '.join(line.split())
@@ -1395,6 +1395,20 @@ def extract_murex_statement(pdf_bytes: bytes, include_open_positions: bool = Tru
             ):
                 if fx_option_header_key is None or key < fx_option_header_key:
                     fx_option_header_key = key
+                continue
+            # FX Swap/NDF header: has CCY1/CCY2 cols but no Contract Description.
+            # Keep it separate so it doesn't overwrite commodity col_ranges.
+            is_fx_swap_header = (
+                ('CCY1' in lc or 'Ccy1' in lc_ns or 'Ccy 1' in lc)
+                and 'Contract Description' not in lc
+                and 'ContractDescription' not in lc_ns
+            )
+            if is_fx_swap_header:
+                cr = _murex_build_col_ranges(items)
+                if cr and 'Ccy 1' in cr and 'Ccy 2' in cr:
+                    col_ranges_fx = cr
+                    if fx_swap_header_key is None or key < fx_swap_header_key:
+                        fx_swap_header_key = key
                 continue
             cr = _murex_build_col_ranges(items)
             if not cr:
@@ -1614,12 +1628,11 @@ def extract_murex_statement(pdf_bytes: bytes, include_open_positions: bool = Tru
             # whose product was set by enrich_open_positions_metadata.
             product = _normalize_product_from_description(m_prod.group(1), desc) if m_prod else None
 
-            # FX pair detection: use dedicated Ccy 1 / Ccy 2 columns if present.
-            # Only accept the value if it looks like a 3-letter currency code.
-            if not product:
+            # FX Swap/NDF pair: read Ccy 1 / Ccy 2 from the dedicated FX col ranges.
+            if not product and col_ranges_fx and fx_swap_header_key is not None and key > fx_swap_header_key:
                 _ccy_re = re.compile(r'^[A-Z]{3}$')
-                ccy1_val = (gcol('Ccy 1') or '').strip().upper()
-                ccy2_val = (gcol('Ccy 2') or '').strip().upper()
+                ccy1_val = (_murex_gcol(items, col_ranges_fx, 'Ccy 1') or '').strip().upper()
+                ccy2_val = (_murex_gcol(items, col_ranges_fx, 'Ccy 2') or '').strip().upper()
                 if _ccy_re.match(ccy1_val) and _ccy_re.match(ccy2_val):
                     product = f'{ccy1_val}/{ccy2_val}'
                 elif _ccy_re.match(ccy1_val):
@@ -4240,13 +4253,14 @@ STANDARD_POSITION_COLUMNS = [
     "expiryDate",
     "End Date",
     "settlementPrice",
+    "Settlement Price Time",
     "Trade ID",
     "Trade Date",
     "Account Number",
     "Broker Code",
     "Net Quantity",
     "Last Update",
-    "Contract Month/Year",
+    "Contract",
     "Trade Price",
     "Avg Fill Price",
     "Delta",
@@ -4255,8 +4269,8 @@ STANDARD_POSITION_COLUMNS = [
     "sourceSystem",
     "NOV",
     "Unrealised PNL (OTE)",
+    "Real Unrealised PNL (OTE)",
     "Realised PNL",
-    "Day PNL",
     "Market Value",
 ]
 
@@ -4281,20 +4295,19 @@ OPEN_POSITION_COLUMNS = [
     "Broker Code",
     "Quantity",
     "expiryDate",
-    "Contract Month/Year",
+    "Contract",
     "Trade Price",
     "settlementPrice",
+    "Settlement Price Time",
     "Call/Put",
     "strikePrice",
-    "NOV",
-    "Unrealised PNL (OTE)",
 ]
 
 GROUPED_POSITION_COLUMNS = [
     "Product",
     "Type",
     "Exchange",
-    "Contract Month/Year",
+    "Contract",
     "expiryDate",
     "Trigger/Barrier",
     "Currency",
@@ -4309,6 +4322,7 @@ GROUPED_POSITION_COLUMNS = [
     "Net Quantity",
     "Avg Fill Price",
     "settlementPrice",
+    "Settlement Price Time",
     "NOV",
     "Unrealised PNL (OTE)",
 ]
@@ -4650,7 +4664,7 @@ def _pdf_contract_description_for_view(df: pd.DataFrame) -> pd.Series:
     product = _first_existing(df, ["product", "product_name"], default=None)
     month = _first_existing(df, ["contract_month"], default=None)
     year = _first_existing(df, ["contract_year"], default=None)
-    ref_month = _first_existing(df, ["ref_month", "Contract Month/Year"], default=None)
+    ref_month = _first_existing(df, ["ref_month", "Contract"], default=None)
     exchange_series = _first_existing(df, ["exchange", "Exchange"], default=None)
 
     def clean(v):
@@ -4925,7 +4939,6 @@ def standard_position_view_from_df(df: pd.DataFrame) -> pd.DataFrame:
     market_value_display = _first_existing(out_source, ["market_value", "Market Value", "market_value_signed", "unrealized_pnl", "open_trade_equity"])
     nov_raw = _first_existing(out_source, ["nov", "NOV", "_nov_value"])
     realised_pnl = _first_existing(out_source, ["realised_pnl", "realized_pnl", "Realised PNL", "Realized PNL"])
-    day_pnl = _first_existing(out_source, ["day_pnl", "day_pnl_amount", "Day PNL", "Day P&L"])
 
     contract_description = _pdf_contract_description_for_view(out_source)
     product = _first_existing(out_source, ["product", "product_name"])
@@ -5034,6 +5047,8 @@ def standard_position_view_from_df(df: pd.DataFrame) -> pd.DataFrame:
         "expiryDate": expiry_date,
         "End Date": end_date_value,
         "settlementPrice": settlement_price,
+        # Placeholder column — header only, populated later.
+        "Settlement Price Time": None,
         "Trade ID": trade_id,
         "Trade Date": trade_date,
         "Account Number": account_number,
@@ -5041,7 +5056,7 @@ def standard_position_view_from_df(df: pd.DataFrame) -> pd.DataFrame:
         "Net Quantity": net_qty,
         "Last Update": last_update,
         "Settlement Date": settlement_date,
-        "Contract Month/Year": month_year,
+        "Contract": month_year,
         "Trade Price": trade_price,
         "Avg Fill Price": avg_fill_price,
         "Delta": delta,
@@ -5051,8 +5066,9 @@ def standard_position_view_from_df(df: pd.DataFrame) -> pd.DataFrame:
         "Direction": direction,
         "NOV": nov,
         "Unrealised PNL (OTE)": unrealised_ote_display,
+        # Placeholder column — header only, populated later.
+        "Real Unrealised PNL (OTE)": None,
         "Realised PNL": realised_pnl,
-        "Day PNL": day_pnl,
         "Market Value": market_value_display,
     })
     out = _apply_trade_level_nov_ote_split(out)
@@ -5074,7 +5090,8 @@ def open_positions_standard_view(tables: Dict[str, pd.DataFrame]) -> pd.DataFram
     - Settlement Date is removed from user-facing views.
     - Market Value is hidden/removed from this view.
     - expiryDate is shown when delivery/value/expiration dates are available.
-    - Unrealised PNL (OTE) remains available for position P&L.
+    - NOV and Unrealised PNL (OTE) are dropped (position-level P&L, kept in
+      Aggregated Positions, not the row-level Trades view).
     """
     df = standard_position_view_from_df(tables.get("Open Positions", pd.DataFrame()))
     if df is None or df.empty:
@@ -5084,7 +5101,9 @@ def open_positions_standard_view(tables: Dict[str, pd.DataFrame]) -> pd.DataFram
         df["Trade Price"] = df["Avg Fill Price"]
     elif "Trade Price" in df.columns and "Avg Fill Price" in df.columns:
         df["Trade Price"] = df["Trade Price"].where(df["Trade Price"].notna(), df["Avg Fill Price"])
-    df = df.drop(columns=["Avg Fill Price", "Market Value", "Direction", "Realised PNL", "Day PNL", "Settlement Date"], errors="ignore")
+    # NOV and Unrealised PNL (OTE) are position-level P&L; they are not shown in
+    # the row-level Trades view (kept in Aggregated Positions instead).
+    df = df.drop(columns=["Avg Fill Price", "Market Value", "Direction", "Realised PNL", "Day PNL", "Settlement Date", "NOV", "Unrealised PNL (OTE)"], errors="ignore")
     # Keep expiryDate in the Open Positions column list even when the current PDF
     # has no expiry/value/end date; the app hides it by default when blank.
     df = _apply_conditional_position_columns(df, drop_empty_expiry=False)
@@ -5207,9 +5226,9 @@ def _standardized_realized_pnl_for_grouping(tables: Dict[str, pd.DataFrame]) -> 
 
     out = pd.DataFrame(index=src.index)
     out["Product"] = _first_existing(src, ["product", "product_name"])
-    out["Contract Month/Year"] = _first_existing(src, ["ref_month", "Contract Month/Year"])
-    if out["Contract Month/Year"].isna().all():
-        out["Contract Month/Year"] = _combine_month_year(src)
+    out["Contract"] = _first_existing(src, ["ref_month", "Contract"])
+    if out["Contract"].isna().all():
+        out["Contract"] = _combine_month_year(src)
     out["Account Number"] = _first_existing(src, ["account_number", "Account Number"])
     out["Call/Put"] = _normalize_call_put_series(_first_existing(src, ["option_type", "option_type_raw", "call_put", "Call/Put"]))
     out["strikePrice"] = _first_existing(src, ["strike", "strikePrice"])
@@ -5268,7 +5287,7 @@ def prepare_grouped_positions_display(grouped_df: pd.DataFrame, tables: Dict[str
     if preset == "Product":
         # Product grouping is a pure product-level aggregation. Do not display
         # contract month/year or expiry/value date fields that are not grouping keys.
-        out = out.drop(columns=["Contract Month/Year", "expiryDate", "Settlement Date"], errors="ignore")
+        out = out.drop(columns=["Contract", "expiryDate", "Settlement Date"], errors="ignore")
 
     if drop_option_columns:
         # Product grouping intentionally hides option detail columns, but NOV must
@@ -5561,9 +5580,9 @@ def closed_positions_standard_view(tables: Dict[str, pd.DataFrame]) -> pd.DataFr
     out["Type"]                 = has_option.map({True: "Options", False: "Futures"})
 
     out["Exchange"]             = _first_existing(src, ["exchange", "Exchange"])
-    out["Contract Month/Year"]  = _first_existing(src, ["ref_month", "Contract Month/Year"])
-    if out["Contract Month/Year"].isna().all():
-        out["Contract Month/Year"] = _combine_month_year(src)
+    out["Contract"]  = _first_existing(src, ["ref_month", "Contract"])
+    if out["Contract"].isna().all():
+        out["Contract"] = _combine_month_year(src)
     out["expiryDate"]           = _first_existing(src, ["close_date", "expiryDate", "expiry_date"])
     out["Trigger/Barrier"]      = _first_existing(src, ["trigger_barrier", "Trigger/Barrier"], default=None)
     out["CCY 1"]                = _first_existing(src, ["ccy_1", "primary_currency"], default=None)
@@ -5640,7 +5659,7 @@ def grouped_realized_pnl_view(
     display_group_col_map = {
         "product":        "Product",
         "exchange":       "Exchange",
-        "ref_month":      "Contract Month/Year",
+        "ref_month":      "Contract",
         "account_number": "Account Number",
         "trigger_barrier":"Trigger/Barrier",
         "option_type":    "Call/Put",
@@ -5665,7 +5684,7 @@ def grouped_realized_pnl_view(
     resolved = [display_group_col_map.get(c, c) for c in effective_cols]
     available = [c for c in resolved if c in df.columns]
     if not available:
-        available = [c for c in ["Product", "Exchange", "Contract Month/Year"] if c in df.columns]
+        available = [c for c in ["Product", "Exchange", "Contract"] if c in df.columns]
 
     # Aggregate: sum Realised PNL, Net Quantity, Long, Short.
     # NOV / settlementPrice / Avg Fill Price use _unique_or_multiple (same as other descriptive cols).
@@ -5802,8 +5821,4 @@ def to_excel_bytes(tables: Dict[str, pd.DataFrame]) -> bytes:
                 cell.font = Font(bold=True, color="FFFFFF")
                 cell.fill = PatternFill("solid", fgColor="4F81BD")
                 cell.alignment = Alignment(horizontal="center")
-            for col in ws.columns:
-                width = min(max(len(str(cell.value or "")) for cell in col) + 2, 60)
-                ws.column_dimensions[col[0].column_letter].width = width
-    output.seek(0)
-    return output.getvalue()
+        

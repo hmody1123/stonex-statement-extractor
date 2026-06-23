@@ -1,4 +1,6 @@
-streamlit>=1.36
-pymupdf>=1.24
-pandas>=2.0
-openpyxl>=3.1
+# Upper bounds prevent Streamlit Cloud from auto-pulling surprise major
+# releases. Validated locally on streamlit 1.57 / pandas 2.x / Python 3.12.
+streamlit>=1.40,<2
+pymupdf>=1.24,<2
+pandas>=2.0,<3
+openpyxl>=3.1,<4

@@ -254,6 +254,23 @@ def _cached_to_excel_bytes(_tables, cache_key: str):
     except Exception:
         return b""
 
+
+def _as_download_bytes(payload):
+    """Coerce a bytes-like payload to plain ``bytes`` for ``st.download_button``.
+
+    download_button only accepts str / bytes / file-like objects. The
+    ``@st.cache_data`` layer can hand a cached payload back as a ``bytearray`` or
+    ``memoryview`` (observed on Streamlit Cloud / Python 3.14), which the widget
+    rejects with an "unsupported data type" error. Normalising to ``bytes`` here
+    keeps the Excel download working across Streamlit versions.
+    """
+    if isinstance(payload, bytes):
+        return payload
+    if isinstance(payload, (bytearray, memoryview)):
+        return bytes(payload)
+    return payload
+
+
 def clean_for_display(df):
     if df is None:
         return pd.DataFrame()
@@ -1803,7 +1820,7 @@ if extracted_tables:
         if merged_excel:
             st.download_button(
                 "Download merged Excel",
-                data=merged_excel,
+                data=_as_download_bytes(merged_excel),
                 file_name="stonex_merged_trades_positions.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 key=f"download_merged_{APP_VERSION_TAG}",
@@ -1832,7 +1849,7 @@ if extracted_tables:
                     if _per_file_excel:
                         st.download_button(
                             f"Download Excel for {uploaded.name}",
-                            data=_per_file_excel,
+                            data=_as_download_bytes(_per_file_excel),
                             file_name=uploaded.name.rsplit(".", 1)[0] + "_trades.xlsx",
                             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                             key=f"download_{idx}_{uploaded.name}_{APP_VERSION_TAG}",
